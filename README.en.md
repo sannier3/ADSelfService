@@ -1,7 +1,7 @@
 # ADSelfService-API
 
-**__Readme Languages__** [![Français](https://img.shields.io/badge/lang-Français-blue.svg)](README.md)
-[![English](https://img.shields.io/badge/lang-English-lightgrey.svg)](README.en.md)
+**__Readme Languages__** [![Français](https://img.shields.io/badge/lang-Français-lightgrey.svg)](README.md)
+[![English](https://img.shields.io/badge/lang-English-blue.svg)](README.en.md)
 
 ![License](https://img.shields.io/badge/License-MIT-success?style=flat-square)
 
