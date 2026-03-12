@@ -1,9 +1,9 @@
 # ADSelfService-API
 
-<p align="right">
-  <a href="README.md" style="display:inline-block;padding:6px 12px;margin:0 4px;border-radius:6px;background:#2563eb;color:#fff;text-decoration:none;font-weight:500;">Français</a>
-  <a href="README.en.md" style="display:inline-block;padding:6px 12px;margin:0 4px;border-radius:6px;background:#374151;color:#e5e7eb;text-decoration:none;">English</a>
-</p>
+**__Readme Languages__** [![Français](https://img.shields.io/badge/lang-Français-blue.svg)](README.md)
+[![English](https://img.shields.io/badge/lang-English-lightgrey.svg)](README.en.md)
+
+![License](https://img.shields.io/badge/License-MIT-success?style=flat-square)
 
 API REST .NET 8 pour l'auto-service Active Directory et l'administration d'annuaire, pensée pour un usage intranet avec un client web PHP, des scripts ou des intégrations internes.
 
