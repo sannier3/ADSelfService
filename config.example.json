@@ -1,0 +1,43 @@
+{
+  "Ldap": {
+    "Url": "dc01.example.local",
+    "Port": 389,
+    "Ssl": false,
+    "UseKerberosSealing": true,
+    "IgnoreCertificate": true,
+    "BindDn": "administrateur@example.local",
+    "BindPassword": "VOTRE_MOT_DE_PASSE",
+    "BaseDn": "OU=Users,DC=example,DC=local",
+    "GroupBaseDn": "DC=example,DC=local",
+    "RootDn": "DC=example,DC=local",
+    "AdminGroupDn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local"
+  },
+  "Debug": {
+    "Enabled": false,
+    "ShowPasswords": false,
+    "LogDir": "logs",
+    "Console": true
+  },
+  "Security": {
+    "AllowedIps": [
+      "127.0.0.1",
+      "::1",
+      "192.168.1.0/24"
+    ]
+  },
+  "Pagination": {
+    "Enabled": true,
+    "PageSize": 200
+  },
+  "Server": {
+    "Urls": [
+      "http://0.0.0.0:5000",
+      "https://0.0.0.0:5001"
+    ]
+  },
+  "StartupCheck": {
+    "Enabled": true,
+    "FailFast": true,
+    "ShowDetailsInConsole": false
+  }
+}

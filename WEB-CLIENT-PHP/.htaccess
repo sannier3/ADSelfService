@@ -1,0 +1,35 @@
+# ============================================================
+# Apache : bloquer l'accès aux fichiers et dossiers sensibles
+# ============================================================
+
+# Fichiers SQLite (éviter le téléchargement / lecture directe)
+<Files "*.sqlite">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+</Files>
+
+# Fichiers de config (secrets) — pas d'accès direct en HTTP
+<FilesMatch "^config-intranet(-[^.]*)?\.php$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+</FilesMatch>
+
+# Dossier des logs de rate-limit (rl_logs)
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^rl_logs(/|$) - [F,L]
+</IfModule>
+
+# Dossier data/ si utilisé plus tard pour SQLite / logs
+<IfModule mod_rewrite.c>
+    RewriteRule ^data(/|$) - [F,L]
+</IfModule>
+
+# Fichiers .env et .log à la racine du client
+<FilesMatch "\.(env|log)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+</FilesMatch>

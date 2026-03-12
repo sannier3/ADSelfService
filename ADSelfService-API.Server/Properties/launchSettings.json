@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "ADSelfService-API.Server": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:65344;http://*:65345"
+    }
+  }
+}
