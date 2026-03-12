@@ -1,32 +1,32 @@
-# Reference des endpoints
+# Référence des endpoints
 
-Tous les endpoints renvoient du JSON. Cette API n'embarque pas de mecanisme JWT ou de session HTTP.
+Tous les endpoints renvoient du JSON. Cette API n'embarque pas de mécanisme JWT ou de session HTTP.
 
-## Securite du transport
+## Sécurité du transport
 
-Avant meme d'entrer dans les endpoints, l'API applique :
+Avant même d'entrer dans les endpoints, l'API applique :
 
 - un filtrage par IP via `Security.AllowedIps`
-- un controle optionnel de l'en-tete `X-Internal-Auth` si `InternalSharedSecret` est configure
+- un contrôle optionnel de l'en-tête `X-Internal-Auth` si `InternalSharedSecret` est configuré
 
-Le endpoint `GET /health` est le seul a ne pas exiger `X-Internal-Auth`, mais il reste filtre par IP.
+Le endpoint `GET /health` est le seul à ne pas exiger `X-Internal-Auth`, mais il reste filtré par IP.
 
-Important : le booleen `isAdmin` retourne par `/auth` sert au client. Les routes `/admin/*` doivent etre exposees uniquement a des appels internes de confiance.
+Important : le booléen `isAdmin` retourné par `/auth` sert au client. Les routes `/admin/*` doivent être exposées uniquement à des appels internes de confiance.
 
 ## Conventions communes
 
 - Les identifiants utilisateur acceptent souvent un `sAMAccountName` ou un DN complet.
-- Les groupes peuvent etre resolus selon le endpoint par DN, CN, `sAMAccountName` ou `name`.
+- Les groupes peuvent être résolus selon le endpoint par DN, CN, `sAMAccountName` ou `name`.
 - Les dates sont attendues au format ISO 8601.
-- Quand la pagination est activee, `GET /users` et `GET /groups` ajoutent `X-Page`, `X-Page-Size` et `X-Has-More`.
+- Quand la pagination est activée, `GET /users` et `GET /groups` ajoutent `X-Page`, `X-Page-Size` et `X-Has-More`.
 
-## Sante
+## Santé
 
 ### `GET /health`
 
-Verifie que l'API peut encore se connecter a Active Directory avec le compte de service.
+Vérifie que l'API peut encore se connecter à Active Directory avec le compte de service.
 
-Succes :
+Succès :
 
 ```json
 {
@@ -52,7 +52,7 @@ Body :
 }
 ```
 
-Succes :
+Succès :
 
 ```json
 {
@@ -77,7 +77,7 @@ Succes :
 
 Codes typiques :
 
-- `200` : authentification reussie
+- `200` : authentification réussie
 - `400` : `username` ou `password` manquant
 - `401` : utilisateur introuvable, mot de passe invalide ou expire
 - `403` : compte desactive
@@ -85,17 +85,17 @@ Codes typiques :
 
 ### `GET /user/{sam}`
 
-Retourne les informations de l'utilisateur demande.
+Retourne les informations de l'utilisateur demandé.
 
 Codes typiques :
 
-- `200` : utilisateur trouve
+- `200` : utilisateur trouvé
 - `404` : utilisateur introuvable
 - `500` : erreur serveur
 
 ### `POST /user/updateProfile`
 
-Met a jour des attributs de profil sur un DN utilisateur.
+Met à jour des attributs de profil sur un DN utilisateur.
 
 Body :
 
@@ -114,11 +114,11 @@ Notes :
 
 - une valeur vide supprime l'attribut
 - si aucune modification n'est fournie, l'API renvoie `success: true` avec une note
-- `description` est limitee a 1024 caracteres
+- `description` est limitée à 1024 caractères
 
 Codes typiques :
 
-- `200` : mise a jour effectuee ou deja conforme
+- `200` : mise à jour effectuée ou déjà conforme
 - `400` : body invalide ou erreur LDAP de modification
 - `500` : erreur serveur
 
@@ -148,11 +148,11 @@ Codes typiques :
 
 Query string :
 
-- `includeBuiltins` : `true` ou `false`, `false` par defaut
-- `groups` : `none`, `direct` ou `effective`, `direct` par defaut
-- `page`, `pageSize` : si pagination activee
+- `includeBuiltins` : `true` ou `false`, `false` par défaut
+- `groups` : `none`, `direct` ou `effective`, `direct` par défaut
+- `page`, `pageSize` : si pagination activée
 
-Succes :
+Succès :
 
 ```json
 [
@@ -174,7 +174,7 @@ Succes :
 
 Codes typiques :
 
-- `200` : liste retournee
+- `200` : liste retournée
 - `500` : erreur serveur
 
 ## Groupes
@@ -185,9 +185,9 @@ Query string :
 
 - `baseDn` : facultatif, sinon `GroupBaseDn` puis `RootDn`
 - `search` : filtre sur `cn` ou `sAMAccountName`
-- `page`, `pageSize` : si pagination activee
+- `page`, `pageSize` : si pagination activée
 
-Succes :
+Succès :
 
 ```json
 [
@@ -202,7 +202,7 @@ Succes :
 
 Codes typiques :
 
-- `200` : liste retournee
+- `200` : liste retournée
 - `500` : erreur serveur
 
 ## Arborescence
@@ -212,11 +212,11 @@ Codes typiques :
 Query string :
 
 - `baseDn` : facultatif, sinon `BaseDn` puis `RootDn`
-- `depth` : de `1` a `10`, `3` par defaut
-- `includeLeaves` : `true` ou `false`, `false` par defaut
-- `maxChildren` : `200` par defaut, maximum `2000`
+- `depth` : de `1` à `10`, `3` par défaut
+- `includeLeaves` : `true` ou `false`, `false` par défaut
+- `maxChildren` : `200` par défaut, maximum `2000`
 
-Succes :
+Succès :
 
 ```json
 {
@@ -238,7 +238,7 @@ Succes :
 
 Codes typiques :
 
-- `200` : arborescence retournee
+- `200` : arborescence retournée
 - `500` : erreur serveur
 
 ## Administration des utilisateurs
@@ -264,7 +264,7 @@ Body :
 }
 ```
 
-Succes :
+Succès :
 
 ```json
 {
@@ -301,7 +301,7 @@ Body :
 Notes :
 
 - une valeur vide supprime l'attribut
-- `description` est limitee a 1024 caracteres
+- `description` est limitée à 1024 caractères
 
 ### `POST /admin/moveUser`
 
@@ -375,7 +375,7 @@ Alias lisible de `setUserEnabled` pour activer un compte.
 
 ### `POST /admin/disableUser`
 
-Alias lisible de `setUserEnabled` pour desactiver un compte.
+Alias lisible de `setUserEnabled` pour désactiver un compte.
 
 ### `POST /admin/unlockUser`
 
@@ -389,8 +389,8 @@ Body :
 
 Codes typiques pour les endpoints admin utilisateur :
 
-- `200` : operation reussie
-- `400` : body invalide ou erreur LDAP metier
+- `200` : opération réussie
+- `400` : body invalide ou erreur LDAP métier
 - `404` : utilisateur ou destination introuvable
 - `500` : erreur serveur
 
@@ -509,23 +509,23 @@ Body :
 
 Conditions :
 
-- l'OU doit etre sous `BaseDn`
-- l'OU doit etre vide
-- l'OU ne doit pas etre protegee
+- l'OU doit être sous `BaseDn`
+- l'OU doit être vide
+- l'OU ne doit pas être protégée
 
 Codes typiques :
 
-- `200` : suppression reussie
-- `403` : OU hors perimetre ou protegee
+- `200` : suppression réussie
+- `403` : OU hors périmètre ou protégée
 - `404` : OU introuvable
 - `409` : OU non vide
 - `500` : erreur serveur
 
 ## Codes d'erreur usuels
 
-- `400` : validation ou operation LDAP invalide
-- `401` : echec d'authentification utilisateur
-- `403` : IP non autorisee, secret interne manquant ou operation interdite
+- `400` : validation ou opération LDAP invalide
+- `401` : échec d'authentification utilisateur
+- `403` : IP non autorisée, secret interne manquant ou opération interdite
 - `404` : ressource introuvable
 - `409` : conflit, par exemple OU non vide
 - `500` : erreur serveur ou bind LDAP impossible

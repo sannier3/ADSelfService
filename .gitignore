@@ -88,6 +88,9 @@ Desktop.ini
 # ==============================
 *.zip
 
+# Scripts locaux (non versionnés)
+*.local.ps1
+
 # ==============================
 # Génération locale (publish/outputs)
 # ==============================

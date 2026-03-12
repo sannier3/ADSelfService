@@ -1,11 +1,11 @@
-# ADSelfService-API
+# ADSelfService
 
 **__Readme Languages__** [![Français](https://img.shields.io/badge/lang-Français-lightgrey.svg)](README.md)
 [![English](https://img.shields.io/badge/lang-English-blue.svg)](README.en.md)
 
 ![License](https://img.shields.io/badge/License-MIT-success?style=flat-square)
 
-`ADSelfService-API` is a modern, customizable Active Directory self-service solution that gives end users a simple way to manage their AD identity while giving administrators a central place to handle accounts, groups, and OUs. It is designed for intranet environments, but flexible enough to be adapted to your organization, your web UI, and your internal workflows.
+`ADSelfService` is a modern, customizable Active Directory self-service solution that gives end users a simple way to manage their AD identity while giving administrators a central place to handle accounts, groups, and OUs. It is designed for intranet environments, but flexible enough to be adapted to your organization, your web UI, and your internal workflows.
 
 ## Overview
 
@@ -41,7 +41,7 @@ In practice:
 PHP client / scripts / HTTP tools
               |
               v
-     ADSelfService-API (.NET 8)
+     ADSelfService (.NET 8)
               |
               v
         Active Directory
@@ -149,9 +149,9 @@ The `WEB-CLIENT-PHP` folder can be deployed as-is on your web server. Local conf
 
 Useful documents:
 
-- [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md): full reference for `config.json`
-- [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md): choosing between LDAPS and LDAP + Kerberos
-- [ADSelfService-API.Server/ENDPOINTS.md](ADSelfService-API.Server/ENDPOINTS.md): HTTP endpoint reference
+- [CONFIG-OPTIONS.en.md](CONFIG-OPTIONS.en.md): full reference for `config.json`
+- [ADSelfService-API.Server/LDAP-CONFIG.en.md](ADSelfService-API.Server/LDAP-CONFIG.en.md): choosing between LDAPS and LDAP + Kerberos
+- [ADSelfService-API.Server/ENDPOINTS.en.md](ADSelfService-API.Server/ENDPOINTS.en.md): HTTP endpoint reference
 
 Important notes:
 
@@ -212,10 +212,10 @@ Authentication example:
 
 ## Detailed documentation
 
-- [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md)
-- [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md)
-- [ADSelfService-API.Server/ENDPOINTS.md](ADSelfService-API.Server/ENDPOINTS.md)
-- [ADSelfService-API.Server/CHANGELOG.md](ADSelfService-API.Server/CHANGELOG.md)
+- [CONFIG-OPTIONS.en.md](CONFIG-OPTIONS.en.md)
+- [ADSelfService-API.Server/LDAP-CONFIG.en.md](ADSelfService-API.Server/LDAP-CONFIG.en.md)
+- [ADSelfService-API.Server/ENDPOINTS.en.md](ADSelfService-API.Server/ENDPOINTS.en.md)
+- [ADSelfService-API.Server/CHANGELOG.en.md](ADSelfService-API.Server/CHANGELOG.en.md)
 
 ## Languages
 

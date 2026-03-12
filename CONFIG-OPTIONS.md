@@ -1,12 +1,12 @@
 # Options de configuration
 
-Ce document reference les options lues par l'API dans `config.json`.
+Ce document référence les options lues par l'API dans `config.json`.
 
-## Comment la configuration est chargee
+## Comment la configuration est chargée
 
-- Si `config.json` n'existe pas dans le dossier du binaire, l'application cree automatiquement un `config.json` par defaut puis s'arrete.
+- Si `config.json` n'existe pas dans le dossier du binaire, l'application crée automatiquement un `config.json` par défaut puis s'arrête.
 
-Pour un demarrage depuis les sources, vous pouvez aussi partir du fichier `config.example.json`.
+Pour un démarrage depuis les sources, vous pouvez aussi partir du fichier `config.example.json`.
 
 ## Exemple minimal
 
@@ -19,7 +19,7 @@ Pour un demarrage depuis les sources, vous pouvez aussi partir du fichier `confi
     "UseKerberosSealing": false,
     "IgnoreCertificate": false,
     "BindDn": "svc-adselfservice@example.local",
-    "BindPassword": "mot-de-passe-a-remplacer",
+    "BindPassword": "mot-de-passe-à-remplacer",
     "BaseDn": "OU=Users,DC=example,DC=local",
     "GroupBaseDn": "DC=example,DC=local",
     "RootDn": "DC=example,DC=local",
@@ -37,48 +37,48 @@ Pour un demarrage depuis les sources, vous pouvez aussi partir du fichier `confi
 
 ## Section `Ldap`
 
-Cette section pilote la connexion a Active Directory.
+Cette section pilote la connexion à Active Directory.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `Url` | `string` | Nom du controleur de domaine. En mode Kerberos sur le port `389`, utilisez obligatoirement le FQDN. |
+| `Url` | `string` | Nom du contrôleur de domaine. En mode Kerberos sur le port `389`, utilisez obligatoirement le FQDN. |
 | `Port` | `int` | `389` pour LDAP ou LDAP + Kerberos, `636` pour LDAPS. |
 | `Ssl` | `bool` | `true` pour LDAPS, `false` pour LDAP. |
-| `UseKerberosSealing` | `bool` | Active Sign & Seal en LDAP non TLS pour permettre notamment les changements de mot de passe sur le port `389`. Ignore en LDAPS. |
-| `IgnoreCertificate` | `bool` | Ignore la validation du certificat en LDAPS. Reserve au labo ou au developpement. |
-| `BindDn` | `string` | Identifiant du compte de service LDAP. Format recommande : `user@domaine.local` ou `DOMAINE\user`. |
+| `UseKerberosSealing` | `bool` | Active Sign & Seal en LDAP non TLS pour permettre notamment les changements de mot de passe sur le port `389`. Ignoré en LDAPS. |
+| `IgnoreCertificate` | `bool` | Ignore la validation du certificat en LDAPS. Réservé au labo ou au développement. |
+| `BindDn` | `string` | Identifiant du compte de service LDAP. Format recommandé : `user@domaine.local` ou `DOMAINE\user`. |
 | `BindPassword` | `string` | Mot de passe du compte de service. |
-| `BaseDn` | `string` | DN de base pour les recherches utilisateur. |
+| `BaseDn` | `string` | DN de base pour les recherches utilisateurs. |
 | `GroupBaseDn` | `string` | DN de base pour les recherches de groupes. |
 | `RootDn` | `string` | DN racine du domaine. |
-| `AdminGroupDn` | `string` | Groupe AD considere comme groupe administrateur par la logique metier de l'API. |
+| `AdminGroupDn` | `string` | Groupe AD considéré comme groupe administrateur par la logique métier de l'API. |
 
 Voir aussi [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md).
 
 ## Section `Debug`
 
-Cette section regle les journaux de l'application.
+Cette section règle les journaux de l'application.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `Enabled` | `bool` | Active les logs detailles des requetes et reponses. |
+| `Enabled` | `bool` | Active les logs détaillés des requêtes et réponses. |
 | `ShowPasswords` | `bool` | Affiche les mots de passe dans certains logs de debug. Laissez `false` en production. |
 | `LogDir` | `string` | Dossier de sortie des fichiers de logs. |
 | `Console` | `bool` | Affiche aussi les logs dans la console. |
 
 ## Section `Security`
 
-Cette section controle qui peut appeler l'API.
+Cette section contrôle qui peut appeler l'API.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `AllowedIps` | `string[]` | Liste d'IP ou de plages CIDR autorisees. Toute autre origine recoit une reponse `403`. |
-| `InternalSharedSecret` | `string?` | Secret optionnel compare a l'en-tete `X-Internal-Auth`. Si renseigne, tous les appels sauf `/health` doivent fournir cette valeur exacte. |
+| `AllowedIps` | `string[]` | Liste d'IP ou de plages CIDR autorisées. Toute autre origine reçoit une réponse `403`. |
+| `InternalSharedSecret` | `string?` | Secret optionnel comparé à l'en-tête `X-Internal-Auth`. Si renseigné, tous les appels sauf `/health` doivent fournir cette valeur exacte. |
 
 Important :
 
 - Ce filtrage s'applique au niveau HTTP avant le traitement des endpoints.
-- Les endpoints `/admin/*` doivent donc rester derriere ce perimetre reseau de confiance.
+- Les endpoints `/admin/*` doivent donc rester derrière ce périmètre réseau de confiance.
 
 ## Section `Pagination`
 
@@ -87,29 +87,29 @@ Cette section pilote `GET /users` et `GET /groups`.
 | Option | Type | Description |
 |--------|------|-------------|
 | `Enabled` | `bool` | Active la pagination sur les endpoints de liste. |
-| `PageSize` | `int` | Taille de page par defaut. Doit etre strictement positive. |
+| `PageSize` | `int` | Taille de page par défaut. Doit être strictement positive. |
 
 ## Section `Server`
 
-Cette section regle les URL d'ecoute Kestrel.
+Cette section règle les URL d'écoute Kestrel.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `Urls` | `string[]` | Liste des URL a ecouter, par exemple `http://0.0.0.0:5000` ou `https://0.0.0.0:5001`. |
+| `Urls` | `string[]` | Liste des URL à écouter, par exemple `http://0.0.0.0:5000` ou `https://0.0.0.0:5001`. |
 
 ## Section `StartupCheck`
 
-Cette section controle les verifications faites au demarrage.
+Cette section contrôle les vérifications faites au démarrage.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `Enabled` | `bool` | Active le test TCP LDAP puis le bind du compte de service au demarrage. |
-| `FailFast` | `bool` | Si `true`, l'application s'arrete si le test ou le bind echoue. |
-| `ShowDetailsInConsole` | `bool` | Ajoute le detail de l'exception dans la console en cas d'echec de startup check. |
+| `Enabled` | `bool` | Active le test TCP LDAP puis le bind du compte de service au démarrage. |
+| `FailFast` | `bool` | Si `true`, l'application s'arrête si le test ou le bind échoue. |
+| `ShowDetailsInConsole` | `bool` | Ajoute le détail de l'exception dans la console en cas d'échec de startup check. |
 
 ## Recommandations
 
-- En production, preferez `Ssl=true` et `Port=636`.
+- En production, préférez `Ssl=true` et `Port=636`.
 - Si vous restez en `389`, activez `UseKerberosSealing=true`.
 - Gardez `IgnoreCertificate=false` hors environnement de test.
 - Restreignez `AllowedIps` au serveur PHP, au reverse proxy ou aux outillages internes.
