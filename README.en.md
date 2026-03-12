@@ -5,7 +5,7 @@
 
 ![License](https://img.shields.io/badge/License-MIT-success?style=flat-square)
 
-.NET 8 REST API for Active Directory self-service and directory administration, designed for intranet usage with a PHP web client, scripts, or internal integrations.
+`ADSelfService-API` is a modern, customizable Active Directory self-service solution that gives end users a simple way to manage their AD identity while giving administrators a central place to handle accounts, groups, and OUs. It is designed for intranet environments, but flexible enough to be adapted to your organization, your web UI, and your internal workflows.
 
 ## Overview
 
@@ -17,12 +17,18 @@ The repository contains two main parts:
 Main features:
 
 - Authenticate a domain user with `/auth`.
-- Read and update user profile data.
-- Change the user's password.
+- Read and update user profile data and change the user's password.
+- Access tools assigned by administrators through the web client, depending on the user's permissions.
+- Change password even on first sign-in when the account requires it.
 - Administer AD accounts: create, delete, enable, disable, unlock, rename, move, set expiration.
 - Administer groups: browse, create, delete, add and remove members.
 - Administer OUs: create, update, logically protect, and delete.
 - Browse the directory tree through `/tree`.
+
+In practice:
+
+- a standard user can sign in, view and edit their profile, change their password, and access the tools they are allowed to use
+- an administrator keeps all standard user capabilities and also gets the full administration feature set
 
 ## Who this is for
 
@@ -75,7 +81,7 @@ cd ADSelfService-API.Server
 dotnet run
 ```
 
-When started from a published folder, the application creates `config.json` automatically if neither `config.json` nor `config.yaml` exists. When working from source, you can start from `config.example.json`.
+When started from a published folder, the application creates `config.json` automatically if it does not already exist. When working from source, you can start from `config.example.json`.
 
 ## Install from a release
 
@@ -133,7 +139,7 @@ cd ADSelfService-API.Server
 dotnet publish -c Release
 ```
 
-Then place `config.json` or `config.yaml` next to the published executable.
+Then place `config.json` next to the published executable.
 
 ### PHP client
 
@@ -143,7 +149,7 @@ The `WEB-CLIENT-PHP` folder can be deployed as-is on your web server. Local conf
 
 Useful documents:
 
-- [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md): full reference for `config.json` and `config.yaml`
+- [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md): full reference for `config.json`
 - [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md): choosing between LDAPS and LDAP + Kerberos
 - [ADSelfService-API.Server/ENDPOINTS.md](ADSelfService-API.Server/ENDPOINTS.md): HTTP endpoint reference
 
@@ -155,6 +161,15 @@ Important notes:
 - `InternalSharedSecret` must match on both API and PHP sides if you enable the header-based check.
 
 ## Usage
+
+In day-to-day use, an end user can:
+
+- sign in with their Active Directory account
+- view and edit their profile
+- access the tools assigned to them by administrators
+- change their password, including on first sign-in when a password change is required
+
+An administrator has all of these standard user capabilities, plus the full set of directory administration features exposed by the API and web client.
 
 ### Main endpoints
 
@@ -183,7 +198,7 @@ Authentication example:
 - Enable `InternalSharedSecret` if your PHP client or another internal caller uses it.
 - Prefer LDAPS in production.
 - Only enable `Debug.ShowPasswords` in a tightly controlled troubleshooting context.
-- Never commit `config.json`, `config.yaml`, or `config-intranet.php`.
+- Never commit `config.json` or `config-intranet.php`.
 
 ## Quick troubleshooting
 

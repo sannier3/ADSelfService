@@ -24,7 +24,7 @@ Fonctionnalites principales :
 - filtrage reseau par `AllowedIps`
 - secret interne optionnel via `X-Internal-Auth`
 - generation automatique de `config.json` au premier lancement si aucun fichier de configuration n'est present
-- prise en charge de `config.json` et `config.yaml`
+- prise en charge de `config.json`
 - installation possible en service Windows via `--add-service` et suppression via `--remove-service`
 
 ## Format recommande pour les prochaines entrees

@@ -1,12 +1,10 @@
 # Options de configuration
 
-Ce document reference les options lues par l'API dans `config.json` ou `config.yaml`.
+Ce document reference les options lues par l'API dans `config.json`.
 
 ## Comment la configuration est chargee
 
-- Si ni `config.json` ni `config.yaml` n'existent dans le dossier du binaire, l'application cree automatiquement un `config.json` par defaut puis s'arrete.
-- Si `config.json` existe, il est prioritaire.
-- Sinon, l'application tente de lire `config.yaml`.
+- Si `config.json` n'existe pas dans le dossier du binaire, l'application cree automatiquement un `config.json` par defaut puis s'arrete.
 
 Pour un demarrage depuis les sources, vous pouvez aussi partir du fichier `config.example.json`.
 
@@ -115,4 +113,4 @@ Cette section controle les verifications faites au demarrage.
 - Si vous restez en `389`, activez `UseKerberosSealing=true`.
 - Gardez `IgnoreCertificate=false` hors environnement de test.
 - Restreignez `AllowedIps` au serveur PHP, au reverse proxy ou aux outillages internes.
-- Ne versionnez jamais `config.json`, `config.yaml` ou toute variante contenant de vrais secrets.
+- Ne versionnez jamais `config.json` ou toute variante contenant de vrais secrets.

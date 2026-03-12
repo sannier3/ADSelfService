@@ -5,7 +5,7 @@
 
 ![License](https://img.shields.io/badge/License-MIT-success?style=flat-square)
 
-API REST .NET 8 pour l'auto-service Active Directory et l'administration d'annuaire, pensée pour un usage intranet avec un client web PHP, des scripts ou des intégrations internes.
+Solution de self-service Active Directory moderne et personnalisable, `ADSelfService-API` permet de proposer aux utilisateurs un espace simple pour gerer leur identite AD tout en donnant aux administrateurs une interface centralisee pour piloter les comptes, groupes et OU. Le projet est pense pour un usage intranet, mais reste suffisamment souple pour etre adapte a votre organisation, votre interface web et vos processus internes.
 
 ## Vue d'ensemble
 
@@ -17,12 +17,18 @@ Le projet contient deux briques principales :
 Fonctionnalites couvertes :
 
 - Authentification d'un utilisateur du domaine via `/auth`.
-- Consultation et mise a jour du profil utilisateur.
-- Changement de mot de passe utilisateur.
+- Consultation du profil utilisateur, mise a jour des informations et changement de mot de passe.
+- Acces aux outils mis a disposition par l'administrateur via le client web, selon les droits de l'utilisateur.
+- Changement de mot de passe possible y compris lors de la premiere connexion si le compte l'exige.
 - Administration des comptes AD : creation, suppression, activation, desactivation, deblocage, renommage, deplacement, expiration.
 - Administration des groupes : consultation, creation, suppression, ajout et retrait de membres.
 - Administration des OU : creation, mise a jour, protection logique et suppression.
 - Exploration de l'arborescence AD via `/tree`.
+
+En pratique :
+
+- un utilisateur peut se connecter, consulter son profil, le modifier, changer son mot de passe et acceder a ses outils autorises
+- un administrateur conserve tous les droits utilisateur de base et dispose en plus de toutes les fonctions d'administration
 
 ## Pour qui
 
@@ -70,12 +76,12 @@ Ce parcours est destine au developpement, aux tests ou a la personnalisation.
 ```bash
 git clone <url-du-repo>
 cd ADSelfService-API
-copy config.example.json config.json
+copy config.example.json config.json # <= A modifier ensuite>
 cd ADSelfService-API.Server
 dotnet run
 ```
 
-Au premier lancement depuis une publication, l'application cree `config.json` si aucun `config.json` ni `config.yaml` n'est present dans le dossier du binaire. Depuis les sources, vous pouvez partir de `config.example.json`.
+Au premier lancement depuis une publication, l'application cree `config.json` si aucun `config.json` n'est present dans le dossier du binaire. Depuis les sources, vous pouvez partir de `config.example.json`.
 
 ## Installation depuis une release
 
@@ -133,7 +139,7 @@ cd ADSelfService-API.Server
 dotnet publish -c Release
 ```
 
-Placez ensuite `config.json` ou `config.yaml` a cote du binaire publie.
+Placez ensuite `config.json` a cote du binaire publie.
 
 ### Client PHP
 
@@ -143,7 +149,7 @@ Le dossier `WEB-CLIENT-PHP` peut etre deploye tel quel sur votre serveur web. La
 
 Documents utiles :
 
-- [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md) : reference complete de `config.json` et `config.yaml`
+- [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md) : reference complete de `config.json`
 - [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md) : choisir entre LDAPS et LDAP + Kerberos
 - [ADSelfService-API.Server/ENDPOINTS.md](ADSelfService-API.Server/ENDPOINTS.md) : reference HTTP des endpoints
 
@@ -155,6 +161,15 @@ Points d'attention :
 - `InternalSharedSecret` doit etre renseigne cote API et cote PHP si vous activez le controle par en-tete.
 
 ## Utilisation
+
+Au quotidien, l'utilisateur final peut :
+
+- se connecter avec son compte Active Directory
+- consulter et modifier son profil
+- acceder aux outils que l'administrateur lui a attribues
+- changer son mot de passe, y compris lors d'une premiere connexion avec changement obligatoire
+
+Un administrateur beneficie de toutes ces fonctions utilisateur, avec en plus l'ensemble des fonctions d'administration de l'annuaire exposees par l'API et le client web.
 
 ### Endpoints principaux
 
@@ -183,7 +198,7 @@ Exemple d'authentification :
 - Activez `InternalSharedSecret` si le client PHP ou un autre integrateur l'utilise.
 - Preferez LDAPS en production.
 - N'activez `Debug.ShowPasswords` qu'en environnement de diagnostic tres controle.
-- Ne versionnez jamais `config.json`, `config.yaml` ou `config-intranet.php`.
+- Ne versionnez jamais `config.json` ou `config-intranet.php`.
 
 ## Depannage rapide
 
