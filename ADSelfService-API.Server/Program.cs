@@ -1249,9 +1249,12 @@ public class Program
         // Middlewares sécurité & debug
         app.Use(async (context, next) =>
         {
-            // 1) Vérifie éventuellement la clé partagée interne (X-Internal-Auth)
+            bool isHealth = string.Equals(context.Request.Path, "/health", StringComparison.OrdinalIgnoreCase);
+
+            // 1) Vérifie éventuellement la clé partagée interne (X-Internal-Auth),
+            //    sauf pour /health (qui reste accessible sans secret, mais filtré par IP).
             var shared = cfg.Security.InternalSharedSecret;
-            if (!string.IsNullOrEmpty(shared))
+            if (!isHealth && !string.IsNullOrEmpty(shared))
             {
                 if (!context.Request.Headers.TryGetValue("X-Internal-Auth", out var hdr) ||
                     hdr.Count == 0 ||
@@ -1263,7 +1266,7 @@ public class Program
                 }
             }
 
-            // 2) Vérifie la liste d'IP autorisées
+            // 2) Vérifie la liste d'IP autorisées (y compris pour /health)
             var ip = context.Connection.RemoteIpAddress ?? IPAddress.None;
             if (!IsIpAllowed(ip, cfg.Security))
             {
