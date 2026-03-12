@@ -180,8 +180,66 @@ Les droits affichés (admin utilisateurs / admin domaine) dépendent de la confi
 
 ## Déploiement
 
-- **API** : publier avec `dotnet publish` (ou depuis Visual Studio), placer **config.json** à côté de l’exécutable (ou au chemin lu au démarrage). S’assurer que le compte qui exécute le service peut accéder au réseau (LDAP/LDAPS) et que les **AllowedIps** incluent l’IP du (des) client(s).
-- **Client PHP** : déployer sur un serveur web (IIS, Apache, nginx), PHP 8+, et configurer **config-intranet.php** (API_BASE, secret, etc.). Conserver le **.htaccess** (Apache) et le **web.config** (IIS) fournis pour bloquer l’accès au SQLite, à `rl_logs` et aux configs. Idéalement, le serveur PHP et l’API sont sur un réseau interne et seuls les utilisateurs passent par le navigateur (HTTPS).
+### Méthode 1 — via les releases GitHub (recommandé en production)
+
+Des archives prêtes à l’emploi sont publiées dans les **Releases GitHub** du projet :
+
+- **Serveur API** : `ADSelfService-API-Server.zip`  
+  Contient l’exécutable .NET publié ainsi que tous les fichiers nécessaires au fonctionnement autonome de l’API.
+- **Client intranet PHP** : `ADSelfService-WEBSERVER-Files.zip`  
+  Contient uniquement les fichiers PHP/HTML/CSS/JS à déposer sur un serveur web (Apache2 + PHP, ou IIS + module PHP).
+
+#### 1. Déployer le serveur API (ADSelfService-API-Server.zip)
+
+1. Télécharger l’archive `ADSelfService-API-Server.zip` depuis la page des releases :  
+   `https://github.com/sannier3/ADSelfService/releases`
+2. Décompresser dans un dossier dédié sur le serveur (ex. `C:\ADSelfService-API` ou `/opt/adselfservice-api`).
+3. Lancer une première fois le binaire (ou le script de démarrage fourni) :  
+   - au **premier démarrage**, si aucun `config.json` n’est présent, l’API génère un fichier de configuration à partir de l’exemple et s’arrête, en loguant un message du type :  
+     « Fichier `config.json` créé, merci de le compléter puis relancez. »
+4. Éditer `config.json` :
+   - section **Ldap** : URL/port, BindDn/BindPassword, DN de base, etc.  
+   - section **Security** : `AllowedIps`, éventuel `InternalSharedSecret` partagé avec le client PHP.  
+   - voir [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md) pour le détail.
+5. Relancer l’API en **mode console** pour valider la configuration :
+   - vérifier dans les logs que le **bind LDAP** est OK et que le **StartupCheck** passe.  
+   - tester `GET /health` depuis une IP autorisée.
+6. (Optionnel) Installer le serveur en **service Windows** :
+   - ouvrir une invite de commandes **en tant qu’administrateur** dans le dossier de publication, puis exécuter :  
+     - `ADSelfService-API.Server.exe --add-service`  
+     - cela crée un service `ADSelfServiceAPI` (démarrage automatique) **et le démarre immédiatement**.
+   - pour le supprimer plus tard :  
+     - `ADSelfService-API.Server.exe --remove-service`
+   - le comportement de redémarrage automatique en cas de plantage peut ensuite être ajusté dans `services.msc` (onglet **Récupération**).
+7. Intégrer ensuite le binaire dans votre supervision/hébergement habituel :
+   - service Windows, unité systemd, ou lancement via un gestionnaire de services (NSSM, etc.)  
+   - veiller à ce que le compte de service ait accès au réseau LDAP/LDAPS.
+
+#### 2. Déployer le client PHP (ADSelfService-WEBSERVER-Files.zip)
+
+1. Télécharger `ADSelfService-WEBSERVER-Files.zip` depuis les releases GitHub.
+2. Décompresser le contenu dans un répertoire servi par votre serveur web, par exemple :
+   - Apache2/Linux : `/var/www/adselfservice`
+   - IIS/Windows : `C:\inetpub\wwwroot\adselfservice`
+3. Vérifier que les fichiers de protection sont bien pris en compte :
+   - `.htaccess` sous Apache (bloque `.sqlite`, `rl_logs`, `data`, fichiers de config, `.env`, `.log`).
+   - `web.config` sous IIS (règles équivalentes).
+4. Créer la configuration du client :
+   - copier `config-intranet-default.php` vers `config-intranet.php`.
+   - éditer `config-intranet.php` :
+     - `API_BASE` : URL publique de l’API (ex. `http://192.168.100.10:5000`).  
+     - `INTERNAL_SHARED_SECRET` : secret partagé identique à `InternalSharedSecret` côté API (si utilisé).  
+     - options hCaptcha, limite IP, mode d’envoi des mails (`MAIL_MODE`, `MAILER_API_URL`, `MAILER_API_KEY`, `MAIL_FROM`), Twilio, etc.
+5. S’assurer que le répertoire de base de données / logs est **écrivable** par PHP si vous utilisez SQLite pour les « outils » :
+   - fichier `intranet.sqlite` (ou équivalent) et dossier `rl_logs` doivent pouvoir être créés.
+6. Accéder à `intranet.php` depuis un navigateur :
+   - tester la connexion avec un compte utilisateur du domaine.  
+   - tester l’onglet **Admin** avec un compte membre du groupe AD d’administration.
+
+### Méthode 2 — depuis les sources (développement / personnalisation)
+
+- **API** : cloner le dépôt, modifier si besoin, puis publier avec `dotnet publish` (ou depuis Visual Studio). Placer **config.json** à côté de l’exécutable (ou au chemin lu au démarrage). S’assurer que le compte qui exécute le service peut accéder au réseau (LDAP/LDAPS) et que les **AllowedIps** incluent l’IP du (des) client(s).
+- **Client PHP** : utiliser le dossier `WEB-CLIENT-PHP` du dépôt, le déployer sur un serveur web (IIS, Apache, nginx), PHP 8+, et configurer **config-intranet.php** (API_BASE, secret, etc.). Conserver le **.htaccess** (Apache) et le **web.config** (IIS) fournis pour bloquer l’accès au SQLite, à `rl_logs` et aux configs. Idéalement, le serveur PHP et l’API sont sur un réseau interne et seuls les utilisateurs passent par le navigateur (HTTPS).
 
 ---
 
@@ -193,8 +251,9 @@ Les droits affichés (admin utilisateurs / admin domaine) dépendent de la confi
 | **Échec de connexion LDAP au démarrage** | Vérifier Url, Port, Ssl, BindDn/BindPassword, et pour Kerberos : FQDN, format UPN. Voir [LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md). |
 | **Changement de mot de passe refusé** | En LDAP non chiffré (389 sans Kerberos), AD peut refuser. Activer **UseKerberosSealing** ou utiliser LDAPS. |
 | **Client PHP : « Configuration introuvable »** | Vérifier que **config-intranet.php** existe et que **API_BASE** et **INTERNAL_SHARED_SECRET** sont renseignés (pas de valeurs par défaut). |
+| **Service Windows ne démarre pas / s’arrête immédiatement** | Lancer `ADSelfService-API.Server.exe` **sans argument** en mode console pour voir les erreurs au démarrage (config invalide, LDAP KO, IP non autorisée, etc.). Vérifier aussi les logs dans `Debug.LogDir`. |
 
-Les logs de l’API (dossier configuré par **Debug.LogDir**) et les logs du serveur web/PHP aident au diagnostic.
+Les logs de l’API (dossier configuré par **Debug.LogDir**) et les logs du serveur web/PHP aident au diagnostic. En cas de doute, toujours tester d’abord en mode console avant de remettre à jour le service Windows.
 
 ---
 

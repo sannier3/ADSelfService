@@ -1,4 +1,7 @@
 <?php
+// Version du module "mot de passe oublié" (alignée sur intranet.php)
+$APP_VERSION = '1.00.00';
+
 /**
  * Mot de passe oublié — Demande de code par email, reset via API /admin/changePassword.
  * Utilise config-intranet.php, la même base que l’intranet (outils), et l’envoi de mail
@@ -455,5 +458,8 @@ h1{margin:.2rem 0 1rem;font-size:1.4rem}
       <a class="link" href="intranet.php">← Retour à la connexion</a>
     <?php endif; ?>
   </div>
+  <footer style="margin-top:24px;padding:8px 16px;font-size:12px;opacity:.65;text-align:center;">
+    ADSelfService forgot password v<?= htmlspecialchars($APP_VERSION, ENT_QUOTES, 'UTF-8') ?>
+  </footer>
 </body>
 </html>

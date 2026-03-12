@@ -1,5 +1,7 @@
 <?php
 // intranet.php — Auth, "Mon profil", "Mes outils", "Administration"
+// Version de l'intranet ADSelfService (doit suivre les releases du projet GitHub)
+$APP_VERSION = '1.00.00';
 // Limite la saisie manuelle : sélections pour Groupes & OU (via /groups et /tree)
 error_reporting(E_ALL & ~E_NOTICE & ~E_STRICT & ~E_DEPRECATED);
 error_reporting(0);
@@ -4115,6 +4117,9 @@ if ($uiError) {
             <?php endif; ?>
         </div>
     </div>
+    <footer style="margin-top:24px;padding:8px 16px;font-size:12px;opacity:.65;text-align:center;">
+        ADSelfService intranet PHP v<?= htmlspecialchars($APP_VERSION, ENT_QUOTES, 'UTF-8') ?>
+    </footer>
 </body>
 
 </html>

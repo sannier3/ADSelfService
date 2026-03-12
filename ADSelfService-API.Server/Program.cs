@@ -2,6 +2,7 @@ using Serilog;
 using Serilog.Events;
 using System;
 using System.Security.Principal;
+using System.Diagnostics;
 using System.DirectoryServices.Protocols;
 using System.Net;
 using System.Net.Sockets;
@@ -18,6 +19,7 @@ namespace ADSelfService_API.Server;
 
 public class Program
 {
+    public const string AppVersion = "1.00.00";
     // =======================
     //  Config models
     // =======================
@@ -1137,11 +1139,26 @@ public class Program
     // =======================
     public static void Main(string[] args)
     {
-        // 0) Bootstrap logger (avant d'avoir la config)
+        // 0) Commandes utilitaires pour enregistrer / supprimer le service Windows
+        if (args is { Length: > 0 })
+        {
+            if (Array.Exists(args, a => string.Equals(a, "--add-service", StringComparison.OrdinalIgnoreCase)))
+            {
+                HandleWindowsServiceCommand(add: true);
+                return;
+            }
+            if (Array.Exists(args, a => string.Equals(a, "--remove-service", StringComparison.OrdinalIgnoreCase)))
+            {
+                HandleWindowsServiceCommand(add: false);
+                return;
+            }
+        }
+
+        // 1) Bootstrap logger (avant d'avoir la config)
         var bootstrapLogDir = Path.Combine(AppBase, "logs");
         BootstrapLogger(bootstrapLogDir);
 
-        // 1) Charge config (crée si absente)
+        // 2) Charge config (crée si absente)
         var (cfg, loadErr, created) = LoadConfig();
         if (loadErr != null)
         {
@@ -1157,7 +1174,7 @@ public class Program
             return;
         }
 
-        // 2) Reconfigure logger selon config
+        // 3) Reconfigure logger selon config
         try
         {
             if (!Directory.Exists(cfg!.Debug.LogDir))
@@ -1181,7 +1198,9 @@ public class Program
             Environment.Exit(1);
         }
 
-        // 3) Valide la config
+        Log.Information("ADSelfService-API v{Version} démarrée.", AppVersion);
+
+        // 4) Valide la config
         var errors = ValidateConfig(cfg!);
         if (errors.Count > 0)
         {
@@ -1191,7 +1210,7 @@ public class Program
             Environment.Exit(1);
         }
 
-        // 3b) Détecte valeurs par défaut
+        // 4b) Détecte valeurs par défaut
         if (IsLikelyDefault(cfg))
         {
             Log.Fatal("[CONFIG] La configuration contient encore des valeurs d'exemple (DN ou mot de passe). Modifiez 'config.json' puis relancez.");
@@ -1199,7 +1218,7 @@ public class Program
             Environment.Exit(1);
         }
 
-        // 4) Startup check LDAP
+        // 5) Startup check LDAP
         if (cfg.StartupCheck.Enabled)
         {
             // 4a) Test de connectivité TCP brute (équivalent du bouton "Connect" de ldp.exe)
@@ -3458,5 +3477,82 @@ public class Program
         });
 
         app.Run();
+    }
+
+    private static void HandleWindowsServiceCommand(bool add)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.Error.WriteLine("L'installation du service Windows n'est possible que sous Windows.");
+            return;
+        }
+
+        using var identity = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(identity);
+        var isAdmin = principal.IsInRole(WindowsBuiltInRole.Administrator);
+        if (!isAdmin)
+        {
+            Console.Error.WriteLine("Cette commande nécessite les droits administrateur. Lancez l'invite de commandes en tant qu'administrateur puis réessayez.");
+            return;
+        }
+
+        var exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
+        if (string.IsNullOrWhiteSpace(exePath))
+        {
+            Console.Error.WriteLine("Impossible de déterminer le chemin de l'exécutable.");
+            return;
+        }
+
+        const string serviceName = "ADSelfServiceAPI";
+        const string description = "API REST d'auto-service et d'administration Active Directory.";
+
+        try
+        {
+            if (add)
+            {
+                RunScCommand($"create {serviceName} binPath= \"{exePath}\" start= auto");
+                RunScCommand($"description {serviceName} \"{description}\"");
+                Console.WriteLine($"Service Windows '{serviceName}' créé avec succès.");
+                Console.WriteLine("Démarrez-le ensuite via services.msc ou avec : sc start " + serviceName);
+            }
+            else
+            {
+                RunScCommand($"delete {serviceName}");
+                Console.WriteLine($"Service Windows '{serviceName}' supprimé (il sera définitivement retiré après arrêt).");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Erreur lors de la configuration du service Windows : " + ex.Message);
+        }
+    }
+
+    private static void RunScCommand(string arguments)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "sc",
+            Arguments = arguments,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        using var proc = Process.Start(psi);
+        if (proc == null)
+        {
+            Console.Error.WriteLine("Impossible de lancer la commande 'sc'.");
+            return;
+        }
+
+        var output = proc.StandardOutput.ReadToEnd();
+        var error = proc.StandardError.ReadToEnd();
+        proc.WaitForExit();
+
+        if (!string.IsNullOrWhiteSpace(output))
+            Console.WriteLine(output.Trim());
+        if (!string.IsNullOrWhiteSpace(error))
+            Console.Error.WriteLine(error.Trim());
     }
 }
