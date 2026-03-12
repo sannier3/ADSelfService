@@ -1,68 +1,118 @@
-# Options de configuration (config.json)
+# Options de configuration
 
-Copiez `config.example.json` vers `config.json` puis adaptez les valeurs. Référence des options :
+Ce document reference les options lues par l'API dans `config.json` ou `config.yaml`.
 
-## Ldap
+## Comment la configuration est chargee
 
-| Option | Type | Description |
-|--------|------|-------------|
-| **Url** | string | FQDN du contrôleur de domaine (ex. `dc01.domaine.local`). Pour Kerberos : **obligatoirement le FQDN**, pas l’IP. |
-| **Port** | int | `389` (LDAP / Kerberos) ou `636` (LDAPS). |
-| **Ssl** | bool | `true` = LDAPS (port 636), `false` = LDAP (port 389). |
-| **UseKerberosSealing** | bool | Si `Ssl` = false : `true` active Sign & Seal Kerberos (permet les changements de mot de passe sur port 389). Ignoré en LDAPS. |
-| **IgnoreCertificate** | bool | En LDAPS : `true` pour accepter un certificat non validé (dév / labo). À mettre à `false` en production. |
-| **BindDn** | string | Compte de connexion LDAP. **Recommandé dans tous les cas** (LDAPS ou Kerberos) : format UPN (`user@domaine.local`) ou `DOMAINE\user`. Éviter un DN complet (`CN=...,OU=...`) avec l’authentification `Negotiate`, au risque d’obtenir `The supplied credential is invalid (49)`. |
-| **BindPassword** | string | Mot de passe du compte BindDn. |
-| **BaseDn** | string | DN de base pour la recherche des **utilisateurs** (ex. `OU=Users,DC=domaine,DC=local`). |
-| **GroupBaseDn** | string | DN de base pour la recherche des **groupes** (souvent `DC=domaine,DC=local` ou `CN=Users,...`). |
-| **RootDn** | string | DN racine du domaine (ex. `DC=domaine,DC=local`). |
-| **AdminGroupDn** | string | DN du groupe AD dont les membres sont considérés comme administrateurs par l’API (ex. `CN=ADSyncAdmins,CN=Users,DC=domaine,DC=local`). |
+- Si ni `config.json` ni `config.yaml` n'existent dans le dossier du binaire, l'application cree automatiquement un `config.json` par defaut puis s'arrete.
+- Si `config.json` existe, il est prioritaire.
+- Sinon, l'application tente de lire `config.yaml`.
 
-Voir aussi `ADSelfService-API.Server/LDAP-CONFIG.md` pour LDAPS vs LDAP + Kerberos.
+Pour un demarrage depuis les sources, vous pouvez aussi partir du fichier `config.example.json`.
 
----
+## Exemple minimal
 
-## Debug
+```json
+{
+  "Ldap": {
+    "Url": "dc01.example.local",
+    "Port": 636,
+    "Ssl": true,
+    "UseKerberosSealing": false,
+    "IgnoreCertificate": false,
+    "BindDn": "svc-adselfservice@example.local",
+    "BindPassword": "mot-de-passe-a-remplacer",
+    "BaseDn": "OU=Users,DC=example,DC=local",
+    "GroupBaseDn": "DC=example,DC=local",
+    "RootDn": "DC=example,DC=local",
+    "AdminGroupDn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local"
+  },
+  "Security": {
+    "AllowedIps": [ "127.0.0.1", "::1", "192.168.1.0/24" ],
+    "InternalSharedSecret": null
+  },
+  "Server": {
+    "Urls": [ "http://0.0.0.0:5000" ]
+  }
+}
+```
 
-| Option | Type | Description |
-|--------|------|-------------|
-| **Enabled** | bool | Active les logs de niveau Debug. |
-| **ShowPasswords** | bool | **À garder à false en production.** Inclut les mots de passe dans les logs en cas d’erreur. |
-| **LogDir** | string | Dossier des fichiers de log (ex. `logs`). |
-| **Console** | bool | Écrit aussi les logs sur la console. |
+## Section `Ldap`
 
----
-
-## Security
-
-| Option | Type | Description |
-|--------|------|-------------|
-| **AllowedIps** | string[] | Liste des IP ou CIDR autorisées à appeler l’API (ex. `127.0.0.1`, `::1`, `192.168.1.0/24`). Toute autre IP reçoit 403. |
-| **InternalSharedSecret** | string? | (Optionnel) Clé pré-partagée pour les appels internes. Si renseignée, l’API exige l’en-tête `X-Internal-Auth` avec exactement cette valeur, sinon renvoie 403. Si absente ou vide, aucun contrôle supplémentaire n’est effectué. |
-
----
-
-## Pagination
+Cette section pilote la connexion a Active Directory.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| **Enabled** | bool | Active la pagination sur les endpoints `GET /users` et `GET /groups`. |
-| **PageSize** | int | Nombre d’éléments par page (ex. `200`). |
+| `Url` | `string` | Nom du controleur de domaine. En mode Kerberos sur le port `389`, utilisez obligatoirement le FQDN. |
+| `Port` | `int` | `389` pour LDAP ou LDAP + Kerberos, `636` pour LDAPS. |
+| `Ssl` | `bool` | `true` pour LDAPS, `false` pour LDAP. |
+| `UseKerberosSealing` | `bool` | Active Sign & Seal en LDAP non TLS pour permettre notamment les changements de mot de passe sur le port `389`. Ignore en LDAPS. |
+| `IgnoreCertificate` | `bool` | Ignore la validation du certificat en LDAPS. Reserve au labo ou au developpement. |
+| `BindDn` | `string` | Identifiant du compte de service LDAP. Format recommande : `user@domaine.local` ou `DOMAINE\user`. |
+| `BindPassword` | `string` | Mot de passe du compte de service. |
+| `BaseDn` | `string` | DN de base pour les recherches utilisateur. |
+| `GroupBaseDn` | `string` | DN de base pour les recherches de groupes. |
+| `RootDn` | `string` | DN racine du domaine. |
+| `AdminGroupDn` | `string` | Groupe AD considere comme groupe administrateur par la logique metier de l'API. |
 
----
+Voir aussi [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md).
 
-## Server
+## Section `Debug`
+
+Cette section regle les journaux de l'application.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| **Urls** | string[] | URLs d’écoute Kestrel (ex. `http://0.0.0.0:5000`, `https://0.0.0.0:5001`). |
+| `Enabled` | `bool` | Active les logs detailles des requetes et reponses. |
+| `ShowPasswords` | `bool` | Affiche les mots de passe dans certains logs de debug. Laissez `false` en production. |
+| `LogDir` | `string` | Dossier de sortie des fichiers de logs. |
+| `Console` | `bool` | Affiche aussi les logs dans la console. |
 
----
+## Section `Security`
 
-## StartupCheck
+Cette section controle qui peut appeler l'API.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| **Enabled** | bool | Au démarrage, tente un bind LDAP ; si échec, log (et arrêt si FailFast). |
-| **FailFast** | bool | Si `true` et bind LDAP en échec au démarrage, l’application s’arrête. |
-| **ShowDetailsInConsole** | bool | Affiche le détail de l’échec du bind dans la console au démarrage. |
+| `AllowedIps` | `string[]` | Liste d'IP ou de plages CIDR autorisees. Toute autre origine recoit une reponse `403`. |
+| `InternalSharedSecret` | `string?` | Secret optionnel compare a l'en-tete `X-Internal-Auth`. Si renseigne, tous les appels sauf `/health` doivent fournir cette valeur exacte. |
+
+Important :
+
+- Ce filtrage s'applique au niveau HTTP avant le traitement des endpoints.
+- Les endpoints `/admin/*` doivent donc rester derriere ce perimetre reseau de confiance.
+
+## Section `Pagination`
+
+Cette section pilote `GET /users` et `GET /groups`.
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `Enabled` | `bool` | Active la pagination sur les endpoints de liste. |
+| `PageSize` | `int` | Taille de page par defaut. Doit etre strictement positive. |
+
+## Section `Server`
+
+Cette section regle les URL d'ecoute Kestrel.
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `Urls` | `string[]` | Liste des URL a ecouter, par exemple `http://0.0.0.0:5000` ou `https://0.0.0.0:5001`. |
+
+## Section `StartupCheck`
+
+Cette section controle les verifications faites au demarrage.
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `Enabled` | `bool` | Active le test TCP LDAP puis le bind du compte de service au demarrage. |
+| `FailFast` | `bool` | Si `true`, l'application s'arrete si le test ou le bind echoue. |
+| `ShowDetailsInConsole` | `bool` | Ajoute le detail de l'exception dans la console en cas d'echec de startup check. |
+
+## Recommandations
+
+- En production, preferez `Ssl=true` et `Port=636`.
+- Si vous restez en `389`, activez `UseKerberosSealing=true`.
+- Gardez `IgnoreCertificate=false` hors environnement de test.
+- Restreignez `AllowedIps` au serveur PHP, au reverse proxy ou aux outillages internes.
+- Ne versionnez jamais `config.json`, `config.yaml` ou toute variante contenant de vrais secrets.

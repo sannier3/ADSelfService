@@ -1,273 +1,531 @@
-﻿ok, voilà la doc d’API complète extraite de ton code — endpoints, méthodes, paramètres (query + body) et réponses (succès/erreurs). Tout est JSON. Sécurité : **autorisation par liste d’IP** uniquement (middleware `IsIpAllowed`), pas de token.
+# Reference des endpoints
 
-# Santé
+Tous les endpoints renvoient du JSON. Cette API n'embarque pas de mecanisme JWT ou de session HTTP.
 
-**GET `/health`**
-200 → `{ "status": "ok" }` (bind LDAP OK)
-500 → service indisponible
+## Securite du transport
 
----
+Avant meme d'entrer dans les endpoints, l'API applique :
 
-# Authentification & profil
+- un filtrage par IP via `Security.AllowedIps`
+- un controle optionnel de l'en-tete `X-Internal-Auth` si `InternalSharedSecret` est configure
 
-**POST `/auth`**
-Body → `{ "username": string, "password": string }`
-200 →
+Le endpoint `GET /health` est le seul a ne pas exiger `X-Internal-Auth`, mais il reste filtre par IP.
+
+Important : le booleen `isAdmin` retourne par `/auth` sert au client. Les routes `/admin/*` doivent etre exposees uniquement a des appels internes de confiance.
+
+## Conventions communes
+
+- Les identifiants utilisateur acceptent souvent un `sAMAccountName` ou un DN complet.
+- Les groupes peuvent etre resolus selon le endpoint par DN, CN, `sAMAccountName` ou `name`.
+- Les dates sont attendues au format ISO 8601.
+- Quand la pagination est activee, `GET /users` et `GET /groups` ajoutent `X-Page`, `X-Page-Size` et `X-Has-More`.
+
+## Sante
+
+### `GET /health`
+
+Verifie que l'API peut encore se connecter a Active Directory avec le compte de service.
+
+Succes :
+
+```json
+{
+  "status": "ok"
+}
+```
+
+Codes typiques :
+
+- `200` : service operationnel
+- `500` : bind LDAP impossible
+
+## Authentification et profil
+
+### `POST /auth`
+
+Body :
+
+```json
+{
+  "username": "jdupont",
+  "password": "MonMotDePasse"
+}
+```
+
+Succes :
 
 ```json
 {
   "success": true,
   "user": {
-    "dn": "...",
-    "sAMAccountName": "...",
-    "givenName": "...",
-    "sn": "...",
-    "mail": "...",
-    "memberOf": [ "CN1", "CN2", ... ],               // groupes directs (CN)
-    "memberOfEffective": [ "CNx", ... ],             // directs + imbriqués + primaire
-    "objectGUID": "guid-or-null",
-    "telephoneNumber": "...",
-    "wwwhomepage": "...",
-    "streetAddress": "..."
+    "dn": "CN=Jean Dupont,OU=Users,DC=example,DC=local",
+    "sAMAccountName": "jdupont",
+    "givenName": "Jean",
+    "sn": "Dupont",
+    "mail": "jean.dupont@example.local",
+    "memberOf": [ "ADSyncAdmins" ],
+    "memberOfEffective": [ "ADSyncAdmins", "IT" ],
+    "objectGUID": "guid-ou-null",
+    "telephoneNumber": "0102030405",
+    "wwwhomepage": "",
+    "streetAddress": ""
   },
-  "mustChangePassword": bool,
-  "isAdmin": bool
+  "mustChangePassword": false,
+  "isAdmin": true
 }
 ```
 
-401 → utilisateur introuvable ou mot de passe invalide/expiré
-403 → compte désactivé
-500 → échec bind LDAP / erreur serveur
+Codes typiques :
 
-**GET `/user/{sam}`**
-Path → `{sam}` = sAMAccountName
-200 → objet utilisateur (comme ci-dessus) + `mustChangePassword`, `isAdmin`, `disabled`
-404 → introuvable
-500 → erreur
+- `200` : authentification reussie
+- `400` : `username` ou `password` manquant
+- `401` : utilisateur introuvable, mot de passe invalide ou expire
+- `403` : compte desactive
+- `500` : erreur LDAP ou serveur
 
-**POST `/user/updateProfile`**
-Body → `{ "dn": string, "modifications": { "<attr>": string|null|"" , ... } }`
+### `GET /user/{sam}`
 
-> Valeur `null` ou `""` ⇒ suppression de l’attribut.
-> 200 → `{ "success": true }`
-> 400/500 → erreur
+Retourne les informations de l'utilisateur demande.
 
-**POST `/user/changePassword`**
-Body → `{ "username": string, "currentPassword": string, "newPassword": string }`
-200 → `{ "success": true }`
-401 → `currentPassword` invalide
-404 → utilisateur introuvable
-500 → erreur
+Codes typiques :
 
----
+- `200` : utilisateur trouve
+- `404` : utilisateur introuvable
+- `500` : erreur serveur
 
-# Admin — Mots de passe & état
+### `POST /user/updateProfile`
 
-**POST `/admin/changePassword`**
-Body → `{ "username": string, "newPassword": string, "mustChangeAtNextLogon": bool? }`
-200 → `{ "success": true }`
-404 → introuvable
-500 → erreur / impossible de définir `pwdLastSet`
+Met a jour des attributs de profil sur un DN utilisateur.
 
-**POST `/admin/setUserEnabled`**
-Body → `{ "user": "<sAM|DN>", "enabled": bool }`
-200 → `{ "success": true, "dn": "...", "enabled": bool }`
-404/500 → erreur
-
-**POST `/admin/enableUser`** *(alias clair)*
-Body → `{ "user": "<sAM|DN>" }`
-200 → `{ "success": true, "dn": "...", "enabled": true }`
-
-**POST `/admin/disableUser`** *(alias clair)*
-Body → `{ "user": "<sAM|DN>" }`
-200 → `{ "success": true, "dn": "...", "enabled": false }`
-
-**POST `/admin/unlockUser`**
-Body → `{ "user": "<sAM|DN>" }`
-200 → `{ "success": true }` (ou `note: "Compte déjà déverrouillé."`)
-404/400/500 → erreur
-
----
-
-# Admin — Comptes utilisateurs (CRUD, groupes, déplacement, renommage)
-
-**POST `/admin/createUser`**
-Body →
+Body :
 
 ```json
 {
-  "OuDn": "OU=...,DC=...",
-  "Cn": "Nom affiché",
-  "Sam": "login",
-  "GivenName": "Prénom",
-  "Sn": "Nom",
-  "UserPrincipalName": "user@domaine",
-  "Mail": "user@exemple.tld",               // optional
-  "Password": "xxxx",
-  "Enabled": true,                          // default: true (créé désactivé puis activé si true)
-  "Description": "..." ,                    // optional
-  "ExpiresAt": "2025-12-31T23:59:59Z",     // optional (ISO 8601)
-  "NeverExpires": false                     // optional
+  "dn": "CN=Jean Dupont,OU=Users,DC=example,DC=local",
+  "modifications": {
+    "mail": "jean.dupont@example.local",
+    "telephoneNumber": "0102030405",
+    "streetAddress": ""
+  }
 }
 ```
 
-200 → `{ "success": true, "dn": "CN=...,OU=..." }`
-400 → erreur annuaire (ex. doublon)
-500 → erreur
+Notes :
 
-**POST `/admin/deleteUser`**
-Body → `{ "user": "<sAM|DN>" }`
-200 → `{ "success": true, "dn": "..." }`
-404/400/500 → erreur
+- une valeur vide supprime l'attribut
+- si aucune modification n'est fournie, l'API renvoie `success: true` avec une note
+- `description` est limitee a 1024 caracteres
 
-**POST `/admin/addToGroup`**
-Body → `{ "user": "<sAM|DN>", "groupDn": "<DN|CN|sAM|name>" }`
+Codes typiques :
 
-> `groupDn` est résolu automatiquement par DN/CN/sAM/name.
-> 200 → `{ "success": true }` (ou `note: "Déjà membre du groupe."`)
-> 404/400/500 → erreur
+- `200` : mise a jour effectuee ou deja conforme
+- `400` : body invalide ou erreur LDAP de modification
+- `500` : erreur serveur
 
-**POST `/admin/removeFromGroup`**
-Body → `{ "user": "<sAM|DN>", "groupDn": "<DN|CN|sAM|name>" }`
-200 → `{ "success": true }` (ou `note: "L’utilisateur n’était pas membre du groupe."`)
-404/400/500 → erreur
+### `POST /user/changePassword`
 
-**POST `/admin/updateUser`**
-Body → `{ "user": "<sAM|DN>", "attributes": { "<attr>": string|null|"" , ... } }`
-200 → `{ "success": true, "dn": "..." }`
-404/400/500 → erreur
-
-**POST `/admin/moveUser`**
-Body → `{ "user": "<sAM|DN>", "newOuDn": "OU=...,DC=..." }`
-200 → `{ "success": true, "dn": "CN=...,<newOuDn>" }`
-404 → utilisateur ou OU cible introuvable
-400/500 → erreur
-
-**POST `/admin/renameUserCn`**
-Body → `{ "user": "<sAM|DN>", "newCn": "Nouveau CN" }`
-200 → `{ "success": true, "newDn": "CN=Nouveau CN,..." }`
-404/400/500 → erreur
-
-**POST `/admin/setAccountExpiration`**
-Body → `{ "user": "<sAM|DN>", "expiresAt": "ISO8601"?, "never": true|false? }`
-
-> Requis : `user` et (`never=true` **ou** `expiresAt`).
-> 200 → `{ "success": true, "dn": "...", "expiresNever": bool, "expiresAt": "..."? }`
-> 404/400/500 → erreur
-
----
-
-# Groupes
-
-**GET `/groups`**
-Query →
-
-* `baseDn` (optionnel; défaut = `GroupBaseDn` ou `RootDn`)
-* `search` (filtre sur `cn` ou `sAMAccountName`)
-* `page`, `pageSize` (si pagination activée)
-  200 → `[{ "id": "guid-or-null", "name": "CN", "dn": "...", "sam": "..." }, ... ]`
-  Headers pagination → `X-Page`, `X-Page-Size`, `X-Has-More`
-  500 → erreur
-
-**DELETE|POST `/admin/deleteGroup`**
-Body → `{ "dn": "<DN>" }` **ou** `{ "group": "<DN|CN|sAM|name>" }`
-200 → `{ "success": true, "dn": "..." }`
-404/400/500 → erreur
-
-**POST `/admin/createGroup`**
-Body →
+Body :
 
 ```json
 {
-  "OuDn": "OU=...,DC=...",
-  "Cn": "Nom du groupe",
-  "Sam": "samOptionnel",
-  "Scope": "Global|DomainLocal|Universal",  // default: Global
-  "SecurityEnabled": true,                  // default: true
-  "Description": "..."                      // optional
+  "username": "jdupont",
+  "currentPassword": "AncienMotDePasse",
+  "newPassword": "NouveauMotDePasse"
 }
 ```
 
-200 → `{ "success": true, "dn": "CN=...,OU=..." }`
-404/400/500 → erreur
+Codes typiques :
 
----
+- `200` : mot de passe change
+- `400` : body invalide
+- `401` : mot de passe actuel invalide
+- `404` : utilisateur introuvable
+- `500` : erreur LDAP ou serveur
 
-# OU (Organizational Units)
+## Utilisateurs
 
-**POST `/admin/ou/create`**
-Body → `{ "ParentDn": "OU|CN|DC=...", "Name": "Nom OU", "Description": "..."?, "Protected": true|false? }`
+### `GET /users`
 
-> `ParentDn` doit être sous `BaseDn`. `Protected` ajoute `adminDescription="API_PROTECTED=1"`.
-> 200 → `{ "success": true, "dn": "OU=Name,<ParentDn>" }`
-> 403/404/400/500 → erreur
+Query string :
 
-**POST `/admin/ou/update`**
-Body → `{ "OuDn": "OU=...,DC=...", "NewName": "..."?, "Description": ""|string|null?, "Protected": true|false? }`
+- `includeBuiltins` : `true` ou `false`, `false` par defaut
+- `groups` : `none`, `direct` ou `effective`, `direct` par defaut
+- `page`, `pageSize` : si pagination activee
 
-> `Description: ""` supprime, `null` ne touche pas.
-> 200 → `{ "success": true, "dn": "<nouveau-ou-ancien DN>" }`
-> 403/404/400/500 → erreur
+Succes :
 
-**POST `/admin/ou/delete`**
-Body → `{ "OuDn": "OU=...,DC=..." }`
+```json
+[
+  {
+    "dn": "CN=Jean Dupont,OU=Users,DC=example,DC=local",
+    "sAMAccountName": "jdupont",
+    "givenName": "Jean",
+    "sn": "Dupont",
+    "mail": "jean.dupont@example.local",
+    "telephoneNumber": "0102030405",
+    "wwwhomepage": "",
+    "streetAddress": "",
+    "objectGUID": "guid-ou-null",
+    "disabled": false,
+    "memberOf": [ "IT" ]
+  }
+]
+```
 
-> Doit être sous `BaseDn`, **vide** et **non protégée**.
-> 200 → `{ "success": true, "dn": "..." }`
-> 403 → protégée ou hors périmètre
-> 409 → non vide
-> 404/400/500 → erreur
+Codes typiques :
 
----
+- `200` : liste retournee
+- `500` : erreur serveur
 
-# Arborescence annuaire
+## Groupes
 
-**GET `/tree`**
-Query →
+### `GET /groups`
 
-* `baseDn` (défaut = `BaseDn` sinon `RootDn`)
-* `depth` (1–10, défaut 3)
-* `includeLeaves` (bool, défaut false)
-* `maxChildren` (défaut 200, max 2000)
-  200 →
+Query string :
+
+- `baseDn` : facultatif, sinon `GroupBaseDn` puis `RootDn`
+- `search` : filtre sur `cn` ou `sAMAccountName`
+- `page`, `pageSize` : si pagination activee
+
+Succes :
+
+```json
+[
+  {
+    "id": "guid-ou-null",
+    "name": "ADSyncAdmins",
+    "dn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local",
+    "sam": "ADSyncAdmins"
+  }
+]
+```
+
+Codes typiques :
+
+- `200` : liste retournee
+- `500` : erreur serveur
+
+## Arborescence
+
+### `GET /tree`
+
+Query string :
+
+- `baseDn` : facultatif, sinon `BaseDn` puis `RootDn`
+- `depth` : de `1` a `10`, `3` par defaut
+- `includeLeaves` : `true` ou `false`, `false` par defaut
+- `maxChildren` : `200` par defaut, maximum `2000`
+
+Succes :
 
 ```json
 {
-  "baseDn": "...",
+  "baseDn": "DC=example,DC=local",
   "depth": 3,
   "includeLeaves": false,
   "maxChildren": 200,
   "nodes": [
-    { "name": "...", "dn": "...", "type": "ou|group|user|computer|container|domain|other", "hasChildren": true, "children": [ ... ] }
+    {
+      "name": "Users",
+      "dn": "OU=Users,DC=example,DC=local",
+      "type": "ou",
+      "hasChildren": true,
+      "children": []
+    }
   ]
 }
 ```
 
-500 → erreur
+Codes typiques :
 
----
+- `200` : arborescence retournee
+- `500` : erreur serveur
 
-# Liste / recherche d’utilisateurs
+## Administration des utilisateurs
 
-**GET `/users`**
-Query →
+### `POST /admin/createUser`
 
-* `includeBuiltins` (bool, défaut false) — exclut Guest si false
-* `groups` = `none` | `direct` | `effective` (défaut `direct`)
-* `page`, `pageSize` (si pagination activée)
-  200 → `[{ dn, sAMAccountName, givenName, sn, mail, telephoneNumber, wwwhomepage, streetAddress, objectGUID, disabled, memberOf?, memberOfEffective? }, ...]`
-  Headers pagination → `X-Page`, `X-Page-Size`, `X-Has-More`
-  500 → erreur
+Body :
 
----
+```json
+{
+  "OuDn": "OU=Users,DC=example,DC=local",
+  "Cn": "Jean Dupont",
+  "Sam": "jdupont",
+  "GivenName": "Jean",
+  "Sn": "Dupont",
+  "UserPrincipalName": "jdupont@example.local",
+  "Mail": "jean.dupont@example.local",
+  "Password": "MotDePasseInitial",
+  "Enabled": true,
+  "Description": "Compte intranet",
+  "ExpiresAt": "2026-12-31T23:59:59Z",
+  "NeverExpires": false
+}
+```
 
-# Notes communes
+Succes :
 
-* **Identification user** : beaucoup d’endpoints acceptent **sAMAccountName ou DN** (`user` ou `User`).
-* **Groupes** : `groupDn` peut être DN, **CN**, **sAMAccountName** ou `name` (résolution côté serveur).
-* **Dates d’expiration** : côté AD c’est `accountExpires` (FILETIME). L’API accepte `expiresAt` en **ISO 8601** et `never=true`.
-* **Pagination** : si activée dans la conf, en **GET** `/users` et `/groups` — en-têtes `X-Page`, `X-Page-Size`, `X-Has-More`.
-* **Masquage logs** : mots de passe masqués par défaut.
-* **Codes d’erreur typiques** : `400` (validation/LDAP op), `401` (auth ratée), `403` (accès/compte/OU interdit), `404` (introuvable), `409` (conflit OU non vide), `500` (bind LDAP/exception).
+```json
+{
+  "success": true,
+  "dn": "CN=Jean Dupont,OU=Users,DC=example,DC=local"
+}
+```
 
-Si tu veux, je te fais un **OpenAPI (Swagger) YAML** prêt à coller, à partir de ce mapping.
+### `POST /admin/deleteUser`
+
+Body :
+
+```json
+{
+  "user": "jdupont"
+}
+```
+
+### `POST /admin/updateUser`
+
+Body :
+
+```json
+{
+  "user": "jdupont",
+  "attributes": {
+    "mail": "jean.dupont@example.local",
+    "telephoneNumber": "0102030405",
+    "description": "Compte admin"
+  }
+}
+```
+
+Notes :
+
+- une valeur vide supprime l'attribut
+- `description` est limitee a 1024 caracteres
+
+### `POST /admin/moveUser`
+
+Body :
+
+```json
+{
+  "user": "jdupont",
+  "newOuDn": "OU=Support,DC=example,DC=local"
+}
+```
+
+### `POST /admin/renameUserCn`
+
+Body :
+
+```json
+{
+  "user": "jdupont",
+  "newCn": "Jean Dupont"
+}
+```
+
+### `POST /admin/setAccountExpiration`
+
+Body :
+
+```json
+{
+  "user": "jdupont",
+  "expiresAt": "2026-12-31T23:59:59Z",
+  "never": false
+}
+```
+
+Ou pour supprimer l'expiration :
+
+```json
+{
+  "user": "jdupont",
+  "never": true
+}
+```
+
+### `POST /admin/changePassword`
+
+Body :
+
+```json
+{
+  "username": "jdupont",
+  "newPassword": "NouveauMotDePasse",
+  "mustChangeAtNextLogon": true
+}
+```
+
+### `POST /admin/setUserEnabled`
+
+Body :
+
+```json
+{
+  "user": "jdupont",
+  "enabled": true
+}
+```
+
+### `POST /admin/enableUser`
+
+Alias lisible de `setUserEnabled` pour activer un compte.
+
+### `POST /admin/disableUser`
+
+Alias lisible de `setUserEnabled` pour desactiver un compte.
+
+### `POST /admin/unlockUser`
+
+Body :
+
+```json
+{
+  "user": "jdupont"
+}
+```
+
+Codes typiques pour les endpoints admin utilisateur :
+
+- `200` : operation reussie
+- `400` : body invalide ou erreur LDAP metier
+- `404` : utilisateur ou destination introuvable
+- `500` : erreur serveur
+
+## Administration des groupes
+
+### `POST /admin/createGroup`
+
+Body :
+
+```json
+{
+  "OuDn": "OU=Groups,DC=example,DC=local",
+  "Cn": "Equipe Support",
+  "Sam": "EquipeSupport",
+  "Scope": "Global",
+  "SecurityEnabled": true,
+  "Description": "Groupe Support"
+}
+```
+
+### `POST /admin/addToGroup`
+
+Body :
+
+```json
+{
+  "user": "jdupont",
+  "groupDn": "EquipeSupport"
+}
+```
+
+### `POST /admin/removeFromGroup`
+
+Body :
+
+```json
+{
+  "user": "jdupont",
+  "groupDn": "EquipeSupport"
+}
+```
+
+### `DELETE /admin/deleteGroup`
+
+Ou `POST /admin/deleteGroup` avec un body JSON.
+
+Body accepte l'un des formats suivants :
+
+```json
+{
+  "dn": "CN=Equipe Support,OU=Groups,DC=example,DC=local"
+}
+```
+
+ou
+
+```json
+{
+  "group": "EquipeSupport"
+}
+```
+
+Codes typiques :
+
+- `200` : operation reussie
+- `400` : parametre ou operation LDAP invalide
+- `404` : groupe introuvable
+- `500` : erreur serveur
+
+## Administration des OU
+
+### `POST /admin/ou/create`
+
+Body :
+
+```json
+{
+  "ParentDn": "OU=Users,DC=example,DC=local",
+  "Name": "Prestataires",
+  "Description": "OU des prestataires",
+  "Protected": true
+}
+```
+
+Quand `Protected=true`, l'API marque l'OU avec `adminDescription="API_PROTECTED=1"`.
+
+### `POST /admin/ou/update`
+
+Body :
+
+```json
+{
+  "OuDn": "OU=Prestataires,OU=Users,DC=example,DC=local",
+  "NewName": "Prestataires Externes",
+  "Description": "OU renommee",
+  "Protected": true,
+  "NewParentDn": "OU=RH,DC=example,DC=local"
+}
+```
+
+Notes :
+
+- `Description = null` ne modifie pas le champ
+- `Description = ""` supprime la description
+- `NewParentDn` doit rester sous `BaseDn`
+
+### `POST /admin/ou/delete`
+
+Body :
+
+```json
+{
+  "OuDn": "OU=Prestataires,OU=Users,DC=example,DC=local"
+}
+```
+
+Conditions :
+
+- l'OU doit etre sous `BaseDn`
+- l'OU doit etre vide
+- l'OU ne doit pas etre protegee
+
+Codes typiques :
+
+- `200` : suppression reussie
+- `403` : OU hors perimetre ou protegee
+- `404` : OU introuvable
+- `409` : OU non vide
+- `500` : erreur serveur
+
+## Codes d'erreur usuels
+
+- `400` : validation ou operation LDAP invalide
+- `401` : echec d'authentification utilisateur
+- `403` : IP non autorisee, secret interne manquant ou operation interdite
+- `404` : ressource introuvable
+- `409` : conflit, par exemple OU non vide
+- `500` : erreur serveur ou bind LDAP impossible
