@@ -7,6 +7,8 @@ L’API supporte deux modes pour parler à Active Directory de manière sécuris
 - **Port** : 636  
 - **config.json** : `"Ssl": true`, `"Port": 636`  
 - **Url** : FQDN du contrôleur de domaine (ex. `dc01.domaine.local`) ou IP.  
+- **BindDn** : utiliser de préférence un format **UPN** (`utilisateur@domaine.local`) ou **Down-Level** (`DOMAINE\utilisateur`).  
+  - Avec l’authentification `Negotiate` (valeur utilisée par l’API en LDAPS), un DN complet (`CN=...,OU=...`) peut provoquer `The supplied credential is invalid (code 49)` même si le mot de passe est correct.  
 - Connexion chiffrée TLS ; les changements de mot de passe sont autorisés.
 
 ## 2. LDAP + Kerberos (sans LDAPS)

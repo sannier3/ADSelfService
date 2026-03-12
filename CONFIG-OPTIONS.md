@@ -11,7 +11,7 @@ Copiez `config.example.json` vers `config.json` puis adaptez les valeurs. Réfé
 | **Ssl** | bool | `true` = LDAPS (port 636), `false` = LDAP (port 389). |
 | **UseKerberosSealing** | bool | Si `Ssl` = false : `true` active Sign & Seal Kerberos (permet les changements de mot de passe sur port 389). Ignoré en LDAPS. |
 | **IgnoreCertificate** | bool | En LDAPS : `true` pour accepter un certificat non validé (dév / labo). À mettre à `false` en production. |
-| **BindDn** | string | Compte de connexion LDAP. Kerberos : format UPN (`user@domaine.local`) ou `DOMAINE\user`. LDAPS : DN ou UPN. |
+| **BindDn** | string | Compte de connexion LDAP. **Recommandé dans tous les cas** (LDAPS ou Kerberos) : format UPN (`user@domaine.local`) ou `DOMAINE\user`. Éviter un DN complet (`CN=...,OU=...`) avec l’authentification `Negotiate`, au risque d’obtenir `The supplied credential is invalid (49)`. |
 | **BindPassword** | string | Mot de passe du compte BindDn. |
 | **BaseDn** | string | DN de base pour la recherche des **utilisateurs** (ex. `OU=Users,DC=domaine,DC=local`). |
 | **GroupBaseDn** | string | DN de base pour la recherche des **groupes** (souvent `DC=domaine,DC=local` ou `CN=Users,...`). |
@@ -38,6 +38,7 @@ Voir aussi `ADSelfService-API.Server/LDAP-CONFIG.md` pour LDAPS vs LDAP + Kerber
 | Option | Type | Description |
 |--------|------|-------------|
 | **AllowedIps** | string[] | Liste des IP ou CIDR autorisées à appeler l’API (ex. `127.0.0.1`, `::1`, `192.168.1.0/24`). Toute autre IP reçoit 403. |
+| **InternalSharedSecret** | string? | (Optionnel) Clé pré-partagée pour les appels internes. Si renseignée, l’API exige l’en-tête `X-Internal-Auth` avec exactement cette valeur, sinon renvoie 403. Si absente ou vide, aucun contrôle supplémentaire n’est effectué. |
 
 ---
 

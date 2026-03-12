@@ -446,6 +446,36 @@ function flatten_ou_nodes(array $treeOrNodes, string $prefix = ''): array
     return $out;
 }
 
+function render_ad_tree_nodes(array $nodes): void
+{
+    if (!$nodes) {
+        return;
+    }
+    echo '<ul class="ad-tree-list">';
+    foreach ($nodes as $n) {
+        $dn = htmlspecialchars((string)($n['dn'] ?? ''), ENT_QUOTES);
+        $name = htmlspecialchars((string)($n['name'] ?? ($n['dn'] ?? '')), ENT_QUOTES);
+        $type = strtolower((string)($n['type'] ?? 'other'));
+        $typeEsc = htmlspecialchars($type, ENT_QUOTES);
+        $labelType = $type === 'user' ? 'Utilisateur'
+            : ($type === 'group' ? 'Groupe'
+            : ($type === 'ou' || $type === 'domain' ? 'Conteneur' : ucfirst($type)));
+
+        echo '<li>';
+        echo '<button type="button" class="ad-node" data-dn="' . $dn . '" data-type="' . $typeEsc . '" data-name="' . $name . '">';
+        echo '<span class="ad-node-dot"></span>';
+        echo '<span class="ad-node-label">' . $name . '</span>';
+        echo '<span class="badge subtle">' . htmlspecialchars($labelType, ENT_QUOTES) . '</span>';
+        echo '</button>';
+
+        if (!empty($n['children']) && is_array($n['children'])) {
+            render_ad_tree_nodes($n['children']);
+        }
+        echo '</li>';
+    }
+    echo '</ul>';
+}
+
 // --- Flash messages + PRG ---
 function flash_set(string $area, string $level, string $msg): void
 {
@@ -775,6 +805,7 @@ function app_pdo(): PDO
     } else {
         // SQLite
         $path = $CFG['DB_PATH'] ?? (__DIR__ . '/intranet.sqlite');
+        $isNew = !file_exists($path);
         $pdo = new PDO('sqlite:' . $path, null, null, [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
@@ -782,6 +813,7 @@ function app_pdo(): PDO
         ]);
         $pdo->exec("PRAGMA journal_mode=WAL;");
         $pdo->exec("PRAGMA foreign_keys=ON;");
+        $GLOBALS['TOOLS_SEED_ON_EMPTY'] = $isNew;
     }
 
     return $pdo;
@@ -846,9 +878,14 @@ function tools_bootstrap(PDO $pdo): void
         ");
     }
 
-    // 3) Seed si vide
-    $c = (int) $pdo->query("SELECT COUNT(*) FROM tools")->fetchColumn();
-    if ($c === 0) {
+    // 3) Seed si vide uniquement lors de la première création de la base (SQLite nouvelle)
+    $canSeed = $GLOBALS['TOOLS_SEED_ON_EMPTY'] ?? true;
+    if ($canSeed) {
+        $c = (int) $pdo->query("SELECT COUNT(*) FROM tools")->fetchColumn();
+        if ($c !== 0) {
+            return;
+        }
+
         $ins = $pdo->prepare("INSERT INTO tools
             (title,description,url,icon,group_cns,sort_order,instructions,login_hint_prefix,login_hint_suffix,show_login_hint,enabled)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)");
@@ -1330,31 +1367,22 @@ $forcePwMode = isset($_SESSION['username']) && $mustChange;
 $groupQuery = '';
 $groupResults = [];
 
-/* Précharger options OU (sélection) pour create/move */
+/* Précharger options OU (sélection) pour create/move + arbre complet pour l'explorateur AD */
 $ouOptions = [];
+$adTree = [];
 if ($is_admin) {
-    dd('$_GET', $_GET);
-    dd('$_POST', $_POST);
-
     $userDn = (string) ($userInfo['dn'] ?? '');
-    dd('userInfo.dn', $userDn);
-
     $rootDn = $userDn ? extract_root_dn($userDn) : '';
-    dd('rootDn (extrait)', $rootDn);
 
     $tree = $rootDn ? fetch_ou_tree($rootDn) : fetch_ou_tree('');
-    dd('API /tree httpCode', $tree ? 200 : 0);
-    dd('API /tree baseDn', $tree['baseDn'] ?? null);
-    dd('API /tree nodes sample', array_slice($tree['nodes'] ?? [], 0, 3));
-
     $ouOptions = flatten_ou_nodes($tree);
-    dd('ouOptions count', count($ouOptions));
-    dd('ouOptions first10', array_slice($ouOptions, 0, 10));
 
     if (!$ouOptions) {
         $tree2 = fetch_ou_tree('');
         $ouOptions = flatten_ou_nodes($tree2);
-        dd('ouOptions fallback count', count($ouOptions));
+        $adTree = $tree2;
+    } else {
+        $adTree = $tree;
     }
 }
 
@@ -2617,6 +2645,21 @@ if (
         .link { color: var(--primary); font-weight: 500; }
         .link:hover { color: var(--primary-hover); }
         .page-subtitle { color: var(--sub); font-size: 14px; margin: -0.5rem 0 1.25rem; font-weight: 400; }
+
+        /* Explorateur AD */
+        .ad-explorer { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+        .ad-tree-card { flex:1 1 260px; max-width:360px; }
+        .ad-details-card { flex:2 1 320px; }
+        .ad-tree { max-height:540px; overflow:auto; padding:8px; border-radius:12px; background:#020617; border:1px solid var(--border); }
+        .ad-tree-list { list-style:none; margin:0; padding-left:4px; }
+        .ad-tree-list > li { margin:0; }
+        .ad-tree-list ul { margin-left:14px; padding-left:8px; border-left:1px dashed rgba(148,163,184,.35); }
+        .ad-node { width:100%; text-align:left; background:none; border:none; color:inherit; padding:4px 6px; border-radius:8px; cursor:pointer; display:flex; align-items:center; gap:6px; font-size:14px; }
+        .ad-node:hover { background:#111827; }
+        .ad-node.selected { background:#1d4ed8; color:#e5e7eb; }
+        .ad-node-dot { width:7px; height:7px; border-radius:999px; background:#4b5563; flex-shrink:0; }
+        .ad-node-label { flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .badge.subtle { background:rgba(30,64,175,.12); color:#93c5fd; border:1px solid rgba(59,130,246,.35); }
     </style>
     <script>
         // Seul indicateur côté client conservé (déjà visible à l'écran si actif) :
@@ -2703,6 +2746,37 @@ if (
                 bulkSelect.addEventListener('change', toggleOu);
                 toggleOu();
             }
+
+            // Explorateur AD : sélection de nœud et panneau de détails
+            const adTree = document.getElementById('ad-tree');
+            const adDetails = document.getElementById('ad-details');
+            if (adTree && adDetails) {
+                adTree.addEventListener('click', (e) => {
+                    const node = e.target.closest('.ad-node');
+                    if (!node) return;
+                    adTree.querySelectorAll('.ad-node').forEach(n => n.classList.remove('selected'));
+                    node.classList.add('selected');
+                    const dn = node.getAttribute('data-dn') || '';
+                    const type = node.getAttribute('data-type') || '';
+                    const name = node.getAttribute('data-name') || '';
+                    const typeLabel = type === 'user' ? 'Utilisateur'
+                        : (type === 'group' ? 'Groupe'
+                        : (type === 'ou' || type === 'domain' ? 'Conteneur' : (type || 'Objet')));
+                    adDetails.innerHTML =
+                        '<div><div class=\"small\" style=\"opacity:.8;margin-bottom:6px\">Type</div><div><strong>' +
+                        escapeHtml(typeLabel) + '</strong></div></div>' +
+                        '<div style=\"margin-top:10px\"><div class=\"small\" style=\"opacity:.8;margin-bottom:6px\">Nom</div><div>' +
+                        '<code>' + escapeHtml(name || dn) + '</code></div></div>' +
+                        '<div style=\"margin-top:10px\"><div class=\"small\" style=\"opacity:.8;margin-bottom:6px\">DN complet</div><div>' +
+                        '<code>' + escapeHtml(dn) + '</code></div></div>';
+                });
+            }
+
+            function escapeHtml(str) {
+                return String(str).replace(/[&<>"']/g, function (m) {
+                    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[m];
+                });
+            }
         });
     </script>
 </head>
@@ -2763,6 +2837,7 @@ if ($uiError) {
                         <button class="tab-btn" data-tab="admin-users" onclick="setActive('admin-users')">Admin utilisateurs</button>
                     <?php endif; ?>
                     <?php if ($canDomainAdmin): ?>
+                        <button class="tab-btn" data-tab="explorer" onclick="setActive('explorer')">Explorateur AD</button>
                         <button class="tab-btn" data-tab="admin-domain" onclick="setActive('admin-domain')">Admin domaine</button>
                     <?php endif; ?>
 
@@ -3747,6 +3822,44 @@ if ($uiError) {
                         </div>
                     </div>
 
+                <?php endif; ?>
+            </div>
+
+            <!-- EXPLORATEUR AD (arbre) -->
+            <div id="tab-explorer" class="tab" style="display:none">
+                <?php if ($canDomainAdmin): ?>
+                    <h2>Explorateur Active Directory</h2>
+                    <p class="page-subtitle" style="margin-bottom:16px">
+                        Parcourez l’arborescence du domaine (OU, groupes, utilisateurs, ordinateurs) pour visualiser rapidement la structure AD.
+                    </p>
+                    <div class="ad-explorer">
+                        <div class="card ad-tree-card">
+                            <h3 style="margin-top:0">Arborescence</h3>
+                            <div class="ad-tree" id="ad-tree">
+                                <?php
+                                $nodes = [];
+                                if (!empty($adTree) && is_array($adTree)) {
+                                    $nodes = $adTree['nodes'] ?? [];
+                                }
+                                if ($nodes) {
+                                    render_ad_tree_nodes($nodes);
+                                } else {
+                                    echo '<div class="small">Arborescence indisponible (échec de /tree). Vérifiez la connectivité API/LDAP.</div>';
+                                }
+                                ?>
+                            </div>
+                        </div>
+                        <div class="card ad-details-card">
+                            <h3 style="margin-top:0">Détails de l’objet</h3>
+                            <div id="ad-details" class="small">
+                                Sélectionnez un objet dans l’arborescence pour afficher ses informations (DN, type, chemins).
+                            </div>
+                        </div>
+                    </div>
+                <?php else: ?>
+                    <div class="card">
+                        <div class="small">Accès réservé aux administrateurs du domaine.</div>
+                    </div>
                 <?php endif; ?>
             </div>
 

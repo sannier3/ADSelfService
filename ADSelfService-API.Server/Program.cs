@@ -1,4 +1,4 @@
-﻿using Serilog;
+using Serilog;
 using Serilog.Events;
 using System;
 using System.Security.Principal;
@@ -67,6 +67,7 @@ public class Program
     public class SecurityConfig
     {
         public List<string> AllowedIps { get; set; } = new() { "127.0.0.1", "::1" };
+        public string? InternalSharedSecret { get; set; } = null;
     }
 
     public class PaginationConfig
@@ -181,6 +182,34 @@ public class Program
     static string AppBase => AppContext.BaseDirectory;
     static string DefaultConfigJsonPath => Path.Combine(AppBase, "config.json");
     static string DefaultConfigYamlPath => Path.Combine(AppBase, "config.yaml");
+
+    static bool TestLdapTcpConnectivity(AppConfig cfg, out string? error)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            var connectTask = client.ConnectAsync(cfg.Ldap.Url, cfg.Ldap.Port);
+            if (!connectTask.Wait(TimeSpan.FromSeconds(5)))
+            {
+                error = $"Timeout de connexion TCP vers {cfg.Ldap.Url}:{cfg.Ldap.Port}.";
+                return false;
+            }
+
+            if (!client.Connected)
+            {
+                error = $"Impossible de se connecter à {cfg.Ldap.Url}:{cfg.Ldap.Port}.";
+                return false;
+            }
+
+            error = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
 
     static int ComputeGroupType(string scope, bool security)
     {
@@ -1173,11 +1202,27 @@ public class Program
         // 4) Startup check LDAP
         if (cfg.StartupCheck.Enabled)
         {
+            // 4a) Test de connectivité TCP brute (équivalent du bouton "Connect" de ldp.exe)
+            if (!TestLdapTcpConnectivity(cfg, out var connErr))
+            {
+                Log.Error("[STARTUP] Connectivité TCP LDAP KO: {Err}", connErr);
+                if (cfg.StartupCheck.FailFast)
+                {
+                    Log.CloseAndFlush();
+                    Environment.Exit(2);
+                }
+            }
+            else
+            {
+                Log.Information("[STARTUP] TCP LDAP OK vers {Host}:{Port}", cfg.Ldap.Url, cfg.Ldap.Port);
+            }
+
+            // 4b) Test de bind du compte de service (étape suivante)
             try
             {
                 using var c = GetLdapConnection(cfg);
                 if (!BindServiceAccount(c, cfg)) throw new Exception("Bind du compte de service échoué.");
-                Log.Information("[STARTUP] Connectivité LDAP OK.");
+                Log.Information("[STARTUP] Bind LDAP OK.");
             }
             catch (Exception ex)
             {
@@ -1204,6 +1249,21 @@ public class Program
         // Middlewares sécurité & debug
         app.Use(async (context, next) =>
         {
+            // 1) Vérifie éventuellement la clé partagée interne (X-Internal-Auth)
+            var shared = cfg.Security.InternalSharedSecret;
+            if (!string.IsNullOrEmpty(shared))
+            {
+                if (!context.Request.Headers.TryGetValue("X-Internal-Auth", out var hdr) ||
+                    hdr.Count == 0 ||
+                    !string.Equals(hdr[0], shared, StringComparison.Ordinal))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+                    await context.Response.WriteAsync("Accès interdit (clé interne).");
+                    return;
+                }
+            }
+
+            // 2) Vérifie la liste d'IP autorisées
             var ip = context.Connection.RemoteIpAddress ?? IPAddress.None;
             if (!IsIpAllowed(ip, cfg.Security))
             {
@@ -1328,8 +1388,35 @@ public class Program
                 bool mustChangePassword = (entry.Attributes["pwdLastSet"]?[0]?.ToString() == "0");
                 try
                 {
-                    using var userConn = GetLdapConnection(cfg);
-                    userConn.Bind(new NetworkCredential(userDn, req.Password));
+                    // Connexion utilisateur : en LDAPS on utilise un bind simple (Basic + DN),
+                    // en LDAP+Kerberos on privilégie un principal UPN/DOMAIN\user si disponible.
+                    string? upn = entry.Attributes["userPrincipalName"]?[0]?.ToString();
+                    string loginName = upn ?? req.Username;
+
+                    LdapConnection userConn;
+                    if (cfg.Ldap.Ssl)
+                    {
+                        // LDAPS : bind simple avec DN (transport chiffré par TLS)
+                        var id = new LdapDirectoryIdentifier(cfg.Ldap.Url, cfg.Ldap.Port);
+                        userConn = new LdapConnection(id);
+                        userConn.SessionOptions.ProtocolVersion = 3;
+                        userConn.SessionOptions.SecureSocketLayer = true;
+                        if (cfg.Ldap.IgnoreCertificate)
+                        {
+                            userConn.SessionOptions.VerifyServerCertificate = (con, cer) => true;
+                        }
+                        userConn.AuthType = AuthType.Basic;
+                        using (userConn)
+                        {
+                            userConn.Bind(new NetworkCredential(userDn, req.Password));
+                        }
+                    }
+                    else
+                    {
+                        // LDAP + Kerberos (UseKerberosSealing) : on utilise un principal (UPN/DOMAIN\user)
+                        using var kConn = GetLdapConnection(cfg);
+                        kConn.Bind(new NetworkCredential(loginName, req.Password));
+                    }
                 }
                 catch (LdapException lex)
                 {
@@ -1791,8 +1878,29 @@ public class Program
 
                 try
                 {
-                    using var userConn = GetLdapConnection(cfg);
-                    userConn.Bind(new NetworkCredential(userDn, req.CurrentPassword));
+                    // Vérifie le mot de passe actuel en se comportant comme pour /auth :
+                    // - en LDAPS : bind simple (Basic + DN) sur TLS
+                    // - en LDAP+Kerberos : bind avec principal (UPN/DOMAIN\user si possible)
+                    string loginName = req.Username;
+
+                    if (cfg.Ldap.Ssl)
+                    {
+                        var id = new LdapDirectoryIdentifier(cfg.Ldap.Url, cfg.Ldap.Port);
+                        using var userConn = new LdapConnection(id);
+                        userConn.SessionOptions.ProtocolVersion = 3;
+                        userConn.SessionOptions.SecureSocketLayer = true;
+                        if (cfg.Ldap.IgnoreCertificate)
+                        {
+                            userConn.SessionOptions.VerifyServerCertificate = (con, cer) => true;
+                        }
+                        userConn.AuthType = AuthType.Basic;
+                        userConn.Bind(new NetworkCredential(userDn, req.CurrentPassword));
+                    }
+                    else
+                    {
+                        using var kConn = GetLdapConnection(cfg);
+                        kConn.Bind(new NetworkCredential(loginName, req.CurrentPassword));
+                    }
                 }
                 catch (LdapException exBind)
                 {
