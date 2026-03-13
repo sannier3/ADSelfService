@@ -1,14 +1,13 @@
-# Options de configuration
+# Options de configuration (`config.json`)
 
-Ce document référence les options lues par l'API dans `config.json`.
+Ce document décrit les options lues par `ADSelfService-API.Server` et les contraintes réellement appliquées au démarrage.
 
-## Comment la configuration est chargée
+## Chargement de la configuration
 
-- Si `config.json` n'existe pas dans le dossier du binaire, l'application crée automatiquement un `config.json` par défaut puis s'arrête.
+- Si `config.json` n'existe pas à côté du binaire, l'application crée un fichier par défaut puis s'arrête.
+- Vous devez ensuite compléter ce fichier avant redémarrage.
 
-Pour un démarrage depuis les sources, vous pouvez aussi partir du fichier `config.example.json`.
-
-## Exemple minimal
+## Exemple de base (à adapter)
 
 ```json
 {
@@ -19,98 +18,126 @@ Pour un démarrage depuis les sources, vous pouvez aussi partir du fichier `conf
     "UseKerberosSealing": false,
     "IgnoreCertificate": false,
     "BindDn": "svc-adselfservice@example.local",
-    "BindPassword": "mot-de-passe-à-remplacer",
-    "BaseDn": "OU=Users,DC=example,DC=local",
+    "BindPassword": "mot-de-passe-a-remplacer",
+    "BaseDn": "OU=Infra,DC=example,DC=local",
     "GroupBaseDn": "DC=example,DC=local",
     "RootDn": "DC=example,DC=local",
     "AdminGroupDn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local"
   },
   "Security": {
-    "AllowedIps": [ "127.0.0.1", "::1", "192.168.1.0/24" ],
-    "InternalSharedSecret": null
+    "AllowedIps": ["127.0.0.1", "::1", "192.168.1.0/24"],
+    "InternalSharedSecret": "secret-long-et-unique-32-caracteres-minimum",
+    "RequireAppContextHeader": true
+  },
+  "Debug": {
+    "Enabled": false,
+    "ShowPasswords": false,
+    "LogDir": "logs",
+    "Console": true
+  },
+  "Pagination": {
+    "Enabled": true,
+    "PageSize": 200
   },
   "Server": {
-    "Urls": [ "http://0.0.0.0:5000" ]
+    "Urls": ["http://0.0.0.0:5001"]
+  },
+  "StartupCheck": {
+    "Enabled": true,
+    "FailFast": false,
+    "ShowDetailsInConsole": true
   }
 }
 ```
 
 ## Section `Ldap`
 
-Cette section pilote la connexion à Active Directory.
-
 | Option | Type | Description |
-|--------|------|-------------|
-| `Url` | `string` | Nom du contrôleur de domaine. En mode Kerberos sur le port `389`, utilisez obligatoirement le FQDN. |
-| `Port` | `int` | `389` pour LDAP ou LDAP + Kerberos, `636` pour LDAPS. |
-| `Ssl` | `bool` | `true` pour LDAPS, `false` pour LDAP. |
-| `UseKerberosSealing` | `bool` | Active Sign & Seal en LDAP non TLS pour permettre notamment les changements de mot de passe sur le port `389`. Ignoré en LDAPS. |
-| `IgnoreCertificate` | `bool` | Ignore la validation du certificat en LDAPS. Réservé au labo ou au développement. |
-| `BindDn` | `string` | Identifiant du compte de service LDAP. Format recommandé : `user@domaine.local` ou `DOMAINE\user`. |
+|---|---|---|
+| `Url` | `string` | Contrôleur de domaine. En Kerberos sur `389`, utilisez le FQDN. |
+| `Port` | `int` | `389` (LDAP/Kerberos) ou `636` (LDAPS). |
+| `Ssl` | `bool` | Active LDAPS. |
+| `UseKerberosSealing` | `bool` | Active Sign & Seal en LDAP non TLS. |
+| `IgnoreCertificate` | `bool` | Ignore la validation TLS LDAPS (tests uniquement). |
+| `BindDn` | `string` | Compte de service LDAP (`user@domaine` ou `DOMAINE\\user` recommandé). |
 | `BindPassword` | `string` | Mot de passe du compte de service. |
-| `BaseDn` | `string` | DN de base pour les recherches utilisateurs. |
-| `GroupBaseDn` | `string` | DN de base pour les recherches de groupes. |
-| `RootDn` | `string` | DN racine du domaine. |
-| `AdminGroupDn` | `string` | Groupe AD considéré comme groupe administrateur par la logique métier de l'API. |
+| `BaseDn` | `string` | Base de recherche utilisateurs/explorateur. |
+| `GroupBaseDn` | `string` | Base de recherche groupes. |
+| `RootDn` | `string` | Racine de domaine. |
+| `AdminGroupDn` | `string` | Groupe AD de référence admin logique. |
 
-Voir aussi [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md).
+### Règle de sécurité importante
 
-## Section `Debug`
+Au moins un mode de transport protégé doit être actif:
 
-Cette section règle les journaux de l'application.
+- `Ssl=true`, ou
+- `UseKerberosSealing=true`.
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `Enabled` | `bool` | Active les logs détaillés des requêtes et réponses. |
-| `ShowPasswords` | `bool` | Affiche les mots de passe dans certains logs de debug. Laissez `false` en production. |
-| `LogDir` | `string` | Dossier de sortie des fichiers de logs. |
-| `Console` | `bool` | Affiche aussi les logs dans la console. |
+Sinon, la configuration est rejetée au démarrage.
 
 ## Section `Security`
 
-Cette section contrôle qui peut appeler l'API.
+| Option | Type | Description |
+|---|---|---|
+| `AllowedIps` | `string[]` | IP/plages CIDR autorisées à appeler l'API. |
+| `InternalSharedSecret` | `string` | Clé partagée interne. Doit être robuste. |
+| `RequireAppContextHeader` | `bool` | Exige le header `X-App-Context` (recommandé: `true`). |
+
+### Contraintes appliquées
+
+- Si `InternalSharedSecret` est défini avec moins de 32 caractères, démarrage refusé.
+- Les appels hors `/health` doivent fournir `X-Internal-Auth` si la clé est configurée.
+- Les appels sensibles sont filtrés par contexte applicatif (`X-App-Context`) quand `RequireAppContextHeader=true`.
+
+## Section `Debug`
 
 | Option | Type | Description |
-|--------|------|-------------|
-| `AllowedIps` | `string[]` | Liste d'IP ou de plages CIDR autorisées. Toute autre origine reçoit une réponse `403`. |
-| `InternalSharedSecret` | `string?` | Secret optionnel comparé à l'en-tête `X-Internal-Auth`. Si renseigné, tous les appels sauf `/health` doivent fournir cette valeur exacte. |
+|---|---|---|
+| `Enabled` | `bool` | Active les logs détaillés requêtes/réponses. |
+| `ShowPasswords` | `bool` | Affichage des mots de passe en logs. |
+| `LogDir` | `string` | Dossier des logs. |
+| `Console` | `bool` | Sortie console des logs. |
 
-Important :
+### Interdiction
 
-- Ce filtrage s'applique au niveau HTTP avant le traitement des endpoints.
-- Les endpoints `/admin/*` doivent donc rester derrière ce périmètre réseau de confiance.
+- `ShowPasswords=true` est refusé par validation configuration.
 
 ## Section `Pagination`
 
-Cette section pilote `GET /users` et `GET /groups`.
-
 | Option | Type | Description |
-|--------|------|-------------|
-| `Enabled` | `bool` | Active la pagination sur les endpoints de liste. |
-| `PageSize` | `int` | Taille de page par défaut. Doit être strictement positive. |
+|---|---|---|
+| `Enabled` | `bool` | Active la pagination des listes API. |
+| `PageSize` | `int` | Taille de page par défaut, strictement positive. |
 
 ## Section `Server`
 
-Cette section règle les URL d'écoute Kestrel.
-
 | Option | Type | Description |
-|--------|------|-------------|
-| `Urls` | `string[]` | Liste des URL à écouter, par exemple `http://0.0.0.0:5000` ou `https://0.0.0.0:5001`. |
+|---|---|---|
+| `Urls` | `string[]` | URLs d'écoute Kestrel. |
 
 ## Section `StartupCheck`
 
-Cette section contrôle les vérifications faites au démarrage.
-
 | Option | Type | Description |
-|--------|------|-------------|
-| `Enabled` | `bool` | Active le test TCP LDAP puis le bind du compte de service au démarrage. |
-| `FailFast` | `bool` | Si `true`, l'application s'arrête si le test ou le bind échoue. |
-| `ShowDetailsInConsole` | `bool` | Ajoute le détail de l'exception dans la console en cas d'échec de startup check. |
+|---|---|---|
+| `Enabled` | `bool` | Teste connectivité LDAP + bind au démarrage. |
+| `FailFast` | `bool` | Arrête l'application si le test échoue. |
+| `ShowDetailsInConsole` | `bool` | Affiche le détail des erreurs en console. |
 
-## Recommandations
+## Obligatoire / Interdit (résumé)
 
-- En production, préférez `Ssl=true` et `Port=636`.
-- Si vous restez en `389`, activez `UseKerberosSealing=true`.
-- Gardez `IgnoreCertificate=false` hors environnement de test.
-- Restreignez `AllowedIps` au serveur PHP, au reverse proxy ou aux outillages internes.
-- Ne versionnez jamais `config.json` ou toute variante contenant de vrais secrets.
+### Obligatoire
+
+- `InternalSharedSecret` cohérent côté API et client PHP.
+- `AllowedIps` strict.
+- LDAP protégé (`Ssl=true` ou `UseKerberosSealing=true`).
+
+### Interdit
+
+- `Debug.ShowPasswords=true`.
+- Modes LDAP non protégés (ni SSL, ni Kerberos sealing).
+
+## Références utiles
+
+- [README.md](README.md)
+- [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md)
+- [ADSelfService-API.Server/ENDPOINTS.md](ADSelfService-API.Server/ENDPOINTS.md)

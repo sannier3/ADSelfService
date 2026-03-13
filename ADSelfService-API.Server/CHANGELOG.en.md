@@ -1,39 +1,68 @@
-## Changelog
+# Changelog
 
-This file summarizes the main functional changes visible in the repository. For ready‑to‑run binaries, also refer to the project’s published releases.
+This changelog highlights major repository-level changes.
 
-### Unreleased
+## Unreleased
 
-- Reworked documentation to clearly distinguish installation from a release vs running from source.
-- API, configuration, and LDAP documentation aligned with the actual code behavior.
+### Security
 
-### 1.00.00
+- Hardened API access model:
+  - app-context enforcement through `X-App-Context`,
+  - stricter config validation (`InternalSharedSecret`, protected LDAP transport),
+  - startup rejection for unsafe/incomplete security configurations.
+- Hardened forgot-password flow:
+  - dedicated API endpoint `/recovery/lookup`,
+  - reduced account-enumeration exposure,
+  - anti-bruteforce handling in PHP client flow.
+- Secured HTML rendering for tool instructions with strict allowlist sanitization.
 
-Version number as reported by `ADSelfService-API.Server`.
+### API and endpoint contract
 
-Key features:
+- Consolidated group/membership operations around unified explorer endpoints:
+  - `/explorer/group-search`,
+  - `/explorer/user-groups`,
+  - `/explorer/user-groups/set`,
+  - `/explorer/group-members`,
+  - `/explorer/group-members/set`.
+- Removed documented legacy group routes (`addToGroup/removeFromGroup/groupMembers`).
+- Fixed group search scope behavior so `scope=all` correctly includes groups under `RootDn` and subtrees.
 
-- .NET 8 REST API targeting `net8.0-windows`
-- AD authentication via `/auth`
-- user profile read and update
-- user and admin password change
-- user management: create, delete, enable, disable, unlock, rename, move, set expiration
-- group management: list, create, delete, add and remove members
-- OU management: create, update, logically protect, delete
-- `/tree` endpoint to explore the directory
-- network filtering via `AllowedIps`
-- optional internal shared secret via `X-Internal-Auth`
-- automatic `config.json` generation on first run when no configuration file exists
-- support for `config.json`
-- Windows service installation via `--add-service` and removal via `--remove-service`
+### PHP UI and integration logic
 
-### Suggested format for future entries
+- Simplified group/member management flows.
+- Improved readability of user-group displays.
+- Aligned intranet AJAX calls with current API contracts.
+
+### Documentation
+
+- Full Markdown documentation refresh (FR/EN):
+  - clearer structure for users and operators,
+  - strict alignment with current runtime behavior,
+  - stronger deployment and troubleshooting guidance.
+
+## 1.00.00
+
+Initial project baseline:
+
+- .NET 8 API for Active Directory.
+- Authentication, profile, and password flows.
+- User/group/OU administration.
+- PHP intranet client.
+
+## Suggested format for future entries
 
 ```md
 ## x.y.z
 
-- added:
-- changed:
-- fixed:
-```
+### Security
+- ...
 
+### API
+- ...
+
+### UI / Integration
+- ...
+
+### Documentation
+- ...
+```

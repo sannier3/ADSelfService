@@ -7,11 +7,16 @@ $APP_VERSION = '1.00.00';
  * Utilise config-intranet.php, la même base que l’intranet (outils), et l’envoi de mail
  * en mode internal (PHP mail) ou api (votre API mailer).
  */
-session_start([
-    'cookie_httponly' => true,
-    'cookie_secure'   => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on',
-    'cookie_samesite' => 'Lax',
+$sessionLifetime = 12 * 3600;
+session_set_cookie_params([
+    'lifetime' => $sessionLifetime,
+    'path' => '/',
+    'secure' => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on',
+    'httponly' => true,
+    'samesite' => 'Lax',
 ]);
+ini_set('session.gc_maxlifetime', (string) $sessionLifetime);
+session_start();
 
 $CONFIG = @include __DIR__ . '/config-intranet.php';
 if (!is_array($CONFIG)) {
@@ -29,6 +34,14 @@ if (!$FORGOT_ENABLED) {
 $API_BASE = (string) ($CONFIG['API_BASE'] ?? '');
 $API_SHARED_SECRET = (string) ($CONFIG['INTERNAL_SHARED_SECRET'] ?? '');
 $API_INSECURE_SKIP_VERIFY = (bool) ($CONFIG['API_INSECURE_SKIP_VERIFY'] ?? false);
+if ($API_BASE === '' || $API_SHARED_SECRET === '' || strlen($API_SHARED_SECRET) < 32) {
+    http_response_code(500);
+    echo 'Configuration API invalide.';
+    exit;
+}
+if (stripos($API_BASE, 'https://') !== 0) {
+    $API_INSECURE_SKIP_VERIFY = false; // option sans effet en HTTP, neutralisée explicitement
+}
 
 $HCAPTCHA_ENABLED = (bool) ($CONFIG['HCAPTCHA_ENABLED'] ?? true);
 $HCAPTCHA_SITEKEY = (string) ($CONFIG['HCAPTCHA_SITEKEY'] ?? '');
@@ -79,6 +92,7 @@ function callApi(string $method, string $endpoint, ?array $data = null): array
     $url = rtrim($API_BASE, '/') . $endpoint;
     $ch = curl_init($url);
     $hdr = ['Content-Type: application/json'];
+    $hdr[] = 'X-App-Context: forgot-reset';
     if ($API_SHARED_SECRET !== '') $hdr[] = 'X-Internal-Auth: ' . $API_SHARED_SECRET;
     $opt = [CURLOPT_CUSTOMREQUEST => $method, CURLOPT_HTTPHEADER => $hdr, CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 25, CURLOPT_CONNECTTIMEOUT => 10];
     if (stripos($url, 'https://') === 0 && $API_INSECURE_SKIP_VERIFY) {
@@ -126,6 +140,9 @@ function get_pdo(): PDO
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ]);
     } else {
+        if (!extension_loaded('pdo_sqlite') && !extension_loaded('sqlite3')) {
+            throw new RuntimeException('SQLite driver not available: please enable or install sqlite3 (pdo_sqlite).');
+        }
         $path = $CFG['DB_PATH'] ?? (__DIR__ . '/intranet.sqlite');
         $pdo = new PDO('sqlite:' . $path, null, null, [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
@@ -159,6 +176,80 @@ function reset_codes_bootstrap(PDO $pdo): void
             )
         ");
     }
+}
+
+function reset_attempts_bootstrap(PDO $pdo): void
+{
+    $drv = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    if ($drv === 'mysql') {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS reset_attempts (
+                samaccountname VARCHAR(255) NOT NULL,
+                ip VARCHAR(64) NOT NULL,
+                fail_count INT NOT NULL DEFAULT 0,
+                blocked_until DATETIME NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY (samaccountname, ip)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ");
+    } else {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS reset_attempts (
+                samaccountname TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                blocked_until TEXT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (samaccountname, ip)
+            )
+        ");
+    }
+}
+
+function reset_attempts_is_blocked(PDO $pdo, string $sam, string $ip): bool
+{
+    reset_attempts_bootstrap($pdo);
+    $q = $pdo->prepare("SELECT blocked_until FROM reset_attempts WHERE samaccountname = ? AND ip = ? LIMIT 1");
+    $q->execute([$sam, $ip]);
+    $row = $q->fetch(PDO::FETCH_ASSOC);
+    if (!$row || empty($row['blocked_until'])) {
+        return false;
+    }
+    $ts = DateTime::createFromFormat('Y-m-d H:i:s', (string) $row['blocked_until']);
+    return $ts instanceof DateTime && $ts->getTimestamp() > time();
+}
+
+function reset_attempts_register_failure(PDO $pdo, string $sam, string $ip): void
+{
+    reset_attempts_bootstrap($pdo);
+    $now = date('Y-m-d H:i:s');
+    $maxAttempts = 5;
+    $blockMinutes = 30;
+
+    $q = $pdo->prepare("SELECT fail_count FROM reset_attempts WHERE samaccountname = ? AND ip = ? LIMIT 1");
+    $q->execute([$sam, $ip]);
+    $row = $q->fetch(PDO::FETCH_ASSOC);
+    $count = (int) ($row['fail_count'] ?? 0) + 1;
+    $blockedUntil = null;
+    if ($count >= $maxAttempts) {
+        $blockedUntil = date('Y-m-d H:i:s', time() + ($blockMinutes * 60));
+        $count = 0; // on repart après verrouillage
+    }
+
+    if ($row) {
+        $u = $pdo->prepare("UPDATE reset_attempts SET fail_count = ?, blocked_until = ?, updated_at = ? WHERE samaccountname = ? AND ip = ?");
+        $u->execute([$count, $blockedUntil, $now, $sam, $ip]);
+    } else {
+        $i = $pdo->prepare("INSERT INTO reset_attempts (samaccountname, ip, fail_count, blocked_until, updated_at) VALUES (?, ?, ?, ?, ?)");
+        $i->execute([$sam, $ip, $count, $blockedUntil, $now]);
+    }
+}
+
+function reset_attempts_clear(PDO $pdo, string $sam, string $ip): void
+{
+    reset_attempts_bootstrap($pdo);
+    $d = $pdo->prepare("DELETE FROM reset_attempts WHERE samaccountname = ? AND ip = ?");
+    $d->execute([$sam, $ip]);
 }
 
 /**
@@ -270,38 +361,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $identifier = trim((string) ($_POST['identifier'] ?? ''));
             if ($identifier === '') $errors[] = 'Saisissez votre e-mail ou téléphone.';
             if (!$errors && $API_BASE !== '') {
-                $found = null;
-                $page = 1;
-                $pageSize = USER_PAGE_SIZE;
-                do {
-                    $r = callApi('GET', "/users?page={$page}&pageSize={$pageSize}");
-                    if ($r['error'] || !is_array($r['data'])) {
-                        $errors[] = 'Service indisponible.';
-                        break;
-                    }
-                    $users = $r['data'];
-                    $idPhone = normalizePhone($identifier);
-                    foreach ($users as $u) {
-                        $mail = trim((string) ($u['mail'] ?? ''));
-                        $tel = trim((string) ($u['telephoneNumber'] ?? ''));
-                        if ($mail !== '' && strcasecmp($mail, $identifier) === 0) { $found = $u; break; }
-                        if ($idPhone !== false && $tel !== '') {
-                            $telNorm = normalizePhone($tel);
-                            if ($telNorm !== false && $telNorm === $idPhone) { $found = $u; break; }
-                        }
-                    }
-                    if ($found) break;
-                    $hasMore = count($users) === $pageSize;
-                    $page++;
-                } while ($hasMore);
+                // Réponse volontairement uniforme pour éviter l'énumération de comptes.
+                $success = 'Si un compte correspond, un code de réinitialisation a été envoyé. Il est valable ' . RESET_CODE_TTL . ' minutes.';
+                $mode = 'reset';
 
-                if (!$found) $errors[] = 'Aucun compte correspondant.';
+                $lookup = callApi('GET', '/recovery/lookup?identifier=' . rawurlencode($identifier));
+                $found = (!$lookup['error'] && is_array($lookup['data']) && !empty($lookup['data']['found'])) ? $lookup['data'] : null;
 
-                if (!$errors && $found) {
-                    $sam = trim((string) ($found['sAMAccountName'] ?? ''));
-                    if ($sam === '') {
-                        $errors[] = 'Utilisateur introuvable.';
-                    } else {
+                if ($found) {
+                    $sam = trim((string) ($found['sam'] ?? ''));
+                    if ($sam !== '') {
                         $code = random_int(100000, 999999);
                         $now = date('Y-m-d H:i:s');
                         try {
@@ -312,34 +381,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             if ($up->rowCount() === 0) {
                                 $pdo->prepare("INSERT INTO reset_codes (samaccountname, reset_code, reset_code_date) VALUES (?, ?, ?)")->execute([$sam, (string) $code, $now]);
                             }
-                        } catch (Throwable $e) {
-                            $errors[] = 'Erreur interne.';
-                        }
 
-                        if (!$errors) {
                             $sent = false;
-                            $bySms = false;
                             if (filter_var($identifier, FILTER_VALIDATE_EMAIL)) {
-                                $sent = sendResetEmail($identifier, $found['givenName'] ?? $sam, $code);
+                                $sent = sendResetEmail($identifier, (string) ($found['givenName'] ?? $sam), $code);
                             } else {
                                 $phone = normalizePhone($identifier);
-                                if ($phone !== false) {
-                                    if ($TWILIO_SMS_ENABLED) {
-                                        $msg = 'Votre code de réinitialisation : ' . $code . '. Valable ' . RESET_CODE_TTL . ' min.';
-                                        $sent = send_sms_twilio($phone, $msg);
-                                        $bySms = $sent;
-                                    } else {
-                                        $errors[] = 'L’envoi par SMS n’est pas configuré. Utilisez votre adresse e-mail.';
-                                    }
+                                if ($phone !== false && $TWILIO_SMS_ENABLED) {
+                                    $msg = 'Votre code de réinitialisation : ' . $code . '. Valable ' . RESET_CODE_TTL . ' min.';
+                                    $sent = send_sms_twilio($phone, $msg);
                                 }
                             }
-                            if (!$sent && !$errors) $errors[] = 'Échec d’envoi du code.';
-                            elseif ($sent) {
-                                $success = $bySms
-                                    ? 'Un code vous a été envoyé par SMS. Il est valable ' . RESET_CODE_TTL . ' minutes.'
-                                    : 'Un code vous a été envoyé par e-mail. Il est valable ' . RESET_CODE_TTL . ' minutes.';
-                                $mode = 'reset';
+                            if (!$sent) {
+                                error_log('[forgot_password] code generated but delivery failed for ' . $sam);
                             }
+                        } catch (Throwable $e) {
+                            error_log('[forgot_password] request_code failure: ' . $e->getMessage());
                         }
                     }
                 }
@@ -359,34 +416,57 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($sam === '' || $codeIn === '' || $new === '' || $conf === '') $errors[] = 'Tous les champs sont requis.';
             if ($new !== $conf) $errors[] = 'Le mot de passe et sa confirmation diffèrent.';
             if (!$errors) {
+                $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
                 try {
                     $pdo = get_pdo();
                     reset_codes_bootstrap($pdo);
+                    if (reset_attempts_is_blocked($pdo, $sam, $ip)) {
+                        $errors[] = 'Trop de tentatives. Réessayez plus tard.';
+                        $mode = 'reset';
+                    }
+                    if ($errors) {
+                        throw new RuntimeException('blocked');
+                    }
                     $q = $pdo->prepare("SELECT reset_code, reset_code_date FROM reset_codes WHERE samaccountname = ? LIMIT 1");
                     $q->execute([$sam]);
                     $row = $q->fetch(PDO::FETCH_ASSOC);
-                    if (!$row) $errors[] = 'Aucune demande active.';
+                    if (!$row) $errors[] = 'Code invalide ou expiré.';
                     else {
-                        if ((string) $row['reset_code'] !== (string) $codeIn) $errors[] = 'Code incorrect.';
+                        if ((string) $row['reset_code'] !== (string) $codeIn) $errors[] = 'Code invalide ou expiré.';
                         else {
                             $ts = DateTime::createFromFormat('Y-m-d H:i:s', $row['reset_code_date']);
-                            if (!$ts) $errors[] = 'Code invalide.';
+                            if (!$ts) $errors[] = 'Code invalide ou expiré.';
                             else {
                                 $ageMin = (time() - $ts->getTimestamp()) / 60;
-                                if ($ageMin > RESET_CODE_TTL) $errors[] = 'Code expiré.';
+                                if ($ageMin > RESET_CODE_TTL) $errors[] = 'Code invalide ou expiré.';
                             }
                         }
                     }
                 } catch (Throwable $e) {
-                    $errors[] = 'Erreur interne.';
+                    if ($e->getMessage() !== 'blocked') {
+                        $errors[] = 'Erreur interne.';
+                    }
                 }
                 if (!$errors) {
                     $r = callApi('POST', '/admin/changePassword', ['username' => $sam, 'newPassword' => $new]);
-                    if ($r['error']) $errors[] = 'Impossible de changer le mot de passe.';
+                    if ($r['error']) {
+                        $errors[] = 'Impossible de changer le mot de passe.';
+                        try {
+                            reset_attempts_register_failure($pdo, $sam, $ip);
+                        } catch (Throwable) {
+                        }
+                    }
                     else {
                         $pdo->prepare("DELETE FROM reset_codes WHERE samaccountname = ?")->execute([$sam]);
+                        reset_attempts_clear($pdo, $sam, $ip);
                         $success = 'Mot de passe réinitialisé. Vous pouvez vous connecter.';
                         $mode = 'request';
+                    }
+                } else {
+                    try {
+                        $pdo = $pdo ?? get_pdo();
+                        reset_attempts_register_failure($pdo, $sam, $ip ?? ($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
+                    } catch (Throwable) {
                     }
                 }
             }

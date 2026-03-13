@@ -1,31 +1,24 @@
-## LDAP connection
+# LDAP / AD configuration
 
-The API can talk to Active Directory in two main ways:
+This guide explains how to configure AD connectivity for `ADSelfService-API.Server` in a secure and reliable way.
 
-- `LDAPS` over port `636`
-- `LDAP + Kerberos` over port `389`
+## Core rule
 
-Your choice mostly depends on your infrastructure. When in doubt, pick `LDAPS`.
+Runtime now enforces protected LDAP transport. You must use:
 
-### Quick recommendation
+- **LDAPS** (`Ssl=true`, port `636`), or
+- **LDAP + Kerberos sealing** (`Ssl=false`, `UseKerberosSealing=true`, port `389`).
 
-| Scenario | Recommendation |
-|----------|----------------|
-| You have valid AD certificates and port 636 open | use `LDAPS` |
-| You cannot enable LDAPS but the server can use Kerberos | use `LDAP + Kerberos` |
-| You only have plain, unsecured LDAP | not recommended for this API |
+Unprotected mode (`Ssl=false` and `UseKerberosSealing=false`) is rejected.
 
-## Option 1 – LDAPS
+## Recommended choice
 
-`LDAPS` is the recommended mode for production.
+| Context | Recommendation |
+|---|---|
+| Valid AD certificate + open 636 | LDAPS |
+| No LDAPS but controlled Kerberos environment | LDAP + Kerberos sealing |
 
-### When to use it
-
-- you can reach the domain controller over port `636`
-- the controller certificate is valid or trusted in your environment
-- you want standard TLS transport
-
-### Expected settings
+## Option 1 - LDAPS (recommended for production)
 
 ```json
 {
@@ -36,29 +29,22 @@ Your choice mostly depends on your infrastructure. When in doubt, pick `LDAPS`.
     "UseKerberosSealing": false,
     "IgnoreCertificate": false,
     "BindDn": "svc-adselfservice@example.local",
-    "BindPassword": "password"
+    "BindPassword": "password",
+    "BaseDn": "OU=Infra,DC=example,DC=local",
+    "GroupBaseDn": "DC=example,DC=local",
+    "RootDn": "DC=example,DC=local",
+    "AdminGroupDn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local"
   }
 }
 ```
 
-### Important notes
+### Good practices
 
-- `Url` may be a FQDN or an IP, but FQDN is preferable.
-- `BindDn` should ideally use `user@domain.local` or `DOMAIN\user`.
-- Avoid a full DN like `CN=...,OU=...` as `BindDn`.
-- Only set `IgnoreCertificate=true` in test environments.
+- Use a valid certificate on domain controllers.
+- Keep `IgnoreCertificate=false` outside lab/testing.
+- Keep `BindDn` in `user@domain` or `DOMAIN\\user` format.
 
-## Option 2 – LDAP + Kerberos
-
-This mode lets you stay on port `389` while using Kerberos with Sign & Seal.
-
-### When to use it
-
-- you cannot enable LDAPS
-- the server running the API can obtain Kerberos tickets
-- you need to support password changes without TLS
-
-### Expected settings
+## Option 2 - LDAP + Kerberos sealing
 
 ```json
 {
@@ -69,31 +55,47 @@ This mode lets you stay on port `389` while using Kerberos with Sign & Seal.
     "UseKerberosSealing": true,
     "IgnoreCertificate": true,
     "BindDn": "svc-adselfservice@example.local",
-    "BindPassword": "password"
+    "BindPassword": "password",
+    "BaseDn": "OU=Infra,DC=example,DC=local",
+    "GroupBaseDn": "DC=example,DC=local",
+    "RootDn": "DC=example,DC=local",
+    "AdminGroupDn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local"
   }
 }
 ```
 
-### Important notes
+### Attention points
 
-- `Url` must be the domain controller FQDN, not its IP.
-- `BindDn` must use `user@domain.local` or `DOMAIN\user`.
-- The machine or service account must be correctly integrated in the Kerberos environment.
-- Without `UseKerberosSealing=true`, sensitive operations such as password changes may be rejected.
+- `Url` must be DC FQDN (not IP) to avoid Kerberos/SPN issues.
+- The API host must resolve DC names correctly.
+- The service account must be valid for Kerberos authentication.
 
-## Common symptoms
+## Essential LDAP fields
 
-| Issue | Likely cause |
-|-------|--------------|
-| `The supplied credential is invalid (49)` with a correct password | `BindDn` provided as a full DN instead of UPN or `DOMAIN\user` |
-| Connection failure on `389` | wrong FQDN, SPN not resolved, or Kerberos unavailable |
-| Password change rejected | using plain LDAP without Kerberos sealing |
-| Startup check fails | blocked port, invalid certificate, wrong bind, or AD unreachable |
+| Field | Purpose |
+|---|---|
+| `BaseDn` | primary user/explorer scope |
+| `GroupBaseDn` | dedicated group-search base |
+| `RootDn` | domain-wide root scope |
+| `AdminGroupDn` | logical admin group reference |
 
-## Practical tips
+## Common symptoms and checks
 
-- Always test in console mode before installing the Windows service.
-- With `LDAPS`, start with `IgnoreCertificate=false`.
-- With Kerberos, first verify DNS resolution of the controller FQDN.
-- Keep operational DNs (for queries) in `BaseDn`, `GroupBaseDn`, and `RootDn`, not in `BindDn`.
+| Symptom | Check |
+|---|---|
+| Startup failure | incomplete LDAP config, unprotected mode, blocked port |
+| `Bind LDAP échoué` | invalid `BindDn`/`BindPassword`, AD ACL, DNS |
+| Password change failure | missing LDAPS or Kerberos sealing |
+| Kerberos errors on 389 | wrong FQDN, DNS/SPN mismatch |
 
+## Validation checklist
+
+1. `GET /health` returns `200`.
+2. `POST /auth` works with a valid account.
+3. `POST /user/changePassword` succeeds.
+4. `explorer/*` endpoints return results in expected DN scope.
+
+## See also
+
+- [../ENDPOINTS.en.md](../ENDPOINTS.en.md)
+- [../../CONFIG-OPTIONS.en.md](../../CONFIG-OPTIONS.en.md)

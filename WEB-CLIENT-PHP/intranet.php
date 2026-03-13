@@ -19,11 +19,17 @@ header("Cache-Control: no-store"); // pour les pages authentifiées
 // CSP : adapte la liste à tes domaines exacts
 //header("Content-Security-Policy: default-src 'self' https:; img-src 'self' data: https:; script-src 'self' https://hcaptcha.com https://*.hcaptcha.com; frame-src https://hcaptcha.com https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https:; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests");
 
-session_start([
-    'cookie_httponly' => true,
-    'cookie_secure' => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on',
-    'cookie_samesite' => 'Lax',
+$sessionLifetime = 12 * 3600;
+
+session_set_cookie_params([
+    'lifetime' => $sessionLifetime,
+    'path' => '/',
+    'secure' => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on',
+    'httponly' => true,
+    'samesite' => 'Lax',
 ]);
+ini_set('session.gc_maxlifetime', (string) $sessionLifetime);
+session_start();
 
 /* ================================
    Config — via fichiers PHP
@@ -76,6 +82,9 @@ if (
 ) {
     fatal_config("'INTERNAL_SHARED_SECRET' doit être personnalisé dans 'config-intranet.php'.");
 }
+if (strlen((string) $CONFIG['INTERNAL_SHARED_SECRET']) < 32) {
+    fatal_config("'INTERNAL_SHARED_SECRET' doit faire au moins 32 caractères.");
+}
 
 /* Mappage des variables attendues par le reste du code */
 $TRUSTED_PROXIES = array_filter(array_map('trim', explode(',', (string) ($CONFIG['TRUSTED_PROXIES'] ?? ''))));
@@ -88,6 +97,9 @@ $SHOW_CLIENT_IP = (bool) ($CONFIG['SHOW_CLIENT_IP'] ?? true);
 $API_BASE = (string) $CONFIG['API_BASE'];
 $API_SHARED_SECRET = (string) ($CONFIG['INTERNAL_SHARED_SECRET'] ?? '');
 $API_INSECURE_SKIP_VERIFY = (bool) ($CONFIG['API_INSECURE_SKIP_VERIFY'] ?? false);
+if (stripos($API_BASE, 'https://') !== 0) {
+    $API_INSECURE_SKIP_VERIFY = false; // option sans effet en HTTP, neutralisée explicitement
+}
 
 $HCAPTCHA_ENABLED = (bool) ($CONFIG['HCAPTCHA_ENABLED'] ?? true);
 $HCAPTCHA_SITEKEY = (string) ($CONFIG['HCAPTCHA_SITEKEY'] ?? '');
@@ -113,10 +125,6 @@ $RL_WARN_AFTER = (int) ($CONFIG['RL_WARN_AFTER'] ?? 5);
 $groupQueryGlobal = '';
 $groupResultsGlobal = [];
 $groupsHasMoreGlobal = false;
-
-$groupQueryUser = '';
-$groupResultsUser = [];
-$groupsHasMoreUser = false;
 
 // --- DEBUG – toggle persistant via session ---
 // ?debug=1 active, ?debug=0 désactive
@@ -156,6 +164,47 @@ function dd($label, $value)
 /* ================================
    Utilitaires
 =================================== */
+const INTRANET_KEY_COOKIE = 'Intra-Sync-Key';
+
+function intra_sync_key_generate(): string
+{
+    return bin2hex(random_bytes(32));
+}
+
+function intra_sync_key_cookie_params(int $sessionLifetime): array
+{
+    $secure = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on';
+    return [
+        'expires' => time() + $sessionLifetime,
+        'path' => '/',
+        'secure' => $secure,
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ];
+}
+
+function intra_sync_invalidate(): void
+{
+    $_SESSION = [];
+    if (session_id() !== '') {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', [
+            'expires' => time() - 3600,
+            'path' => $params['path'] ?? '/',
+            'secure' => $params['secure'] ?? false,
+            'httponly' => $params['httponly'] ?? true,
+            'samesite' => $params['samesite'] ?? 'Lax',
+        ]);
+    }
+    setcookie(INTRANET_KEY_COOKIE, '', [
+        'expires' => time() - 3600,
+        'path' => '/',
+        'secure' => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on',
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+    session_destroy();
+}
 function ip_in_cidr_list(string $ip, array $cidrs): bool
 {
     foreach ($cidrs as $c) {
@@ -248,6 +297,161 @@ function verifyCaptcha(string $token, string $secret, string $ip): bool
     return is_array($j) && !empty($j['success']);
 }
 
+function api_call_context(string $endpoint): string
+{
+    $path = strtolower((string) parse_url($endpoint, PHP_URL_PATH));
+    $isAdmin = !empty($_SESSION['is_admin']);
+
+    $userInfo = $_SESSION['user_info'] ?? [];
+    $memberOf = $userInfo['memberOf'] ?? [];
+    $memberOf = is_array($memberOf) ? $memberOf : ($memberOf ? [$memberOf] : []);
+    $userCnGroups = ad_groups_to_cn_list($memberOf);
+
+    $cfg = $GLOBALS['CONFIG'] ?? [];
+    $ADM_USER_GROUPS = $cfg['ADM_USER_GROUPS'] ?? [];
+    $ADM_DOMAIN_GROUPS = $cfg['ADM_DOMAIN_GROUPS'] ?? [];
+    if (is_string($ADM_USER_GROUPS))
+        $ADM_USER_GROUPS = array_values(array_filter(array_map('trim', explode(',', $ADM_USER_GROUPS)), 'strlen'));
+    if (is_string($ADM_DOMAIN_GROUPS))
+        $ADM_DOMAIN_GROUPS = array_values(array_filter(array_map('trim', explode(',', $ADM_DOMAIN_GROUPS)), 'strlen'));
+
+    $canUserAdmin = $isAdmin || (is_array($ADM_USER_GROUPS) && count($ADM_USER_GROUPS) > 0 && hasGroup($userCnGroups, $ADM_USER_GROUPS));
+    $canDomainAdmin = $isAdmin || (is_array($ADM_DOMAIN_GROUPS) && count($ADM_DOMAIN_GROUPS) > 0 && hasGroup($userCnGroups, $ADM_DOMAIN_GROUPS));
+
+    if ($path === '/auth')
+        return 'intranet-login';
+    if (str_starts_with($path, '/explorer/') || $path === '/tree' || $path === '/meta/ad' || $path === '/groups'
+        || str_starts_with($path, '/admin/ou/') || $path === '/admin/creategroup' || $path === '/admin/deletegroup') {
+        return $canDomainAdmin ? 'admin-domain' : 'self-service';
+    }
+    if ($path === '/admin/changepassword') {
+        if ($canDomainAdmin)
+            return 'admin-domain';
+        if ($canUserAdmin)
+            return 'admin-user';
+        return 'self-service';
+    }
+    if (str_starts_with($path, '/admin/')) {
+        if ($canDomainAdmin)
+            return 'admin-domain';
+        if ($canUserAdmin)
+            return 'admin-user';
+        return 'self-service';
+    }
+    if (str_starts_with($path, '/user/') || str_starts_with($path, '/users'))
+        return ($canUserAdmin || $canDomainAdmin) ? 'admin-user' : 'self-service';
+    return 'self-service';
+}
+
+function sanitize_tool_instructions_html(string $html): string
+{
+    $html = trim($html);
+    if ($html === '')
+        return '';
+
+    $allowedTags = ['p', 'br', 'strong', 'b', 'em', 'i', 'u', 'ul', 'ol', 'li', 'a', 'img', 'div', 'span', 'code', 'pre', 'blockquote'];
+    $allowedAttrs = [
+        'a' => ['href', 'title', 'target', 'rel'],
+        'img' => ['src', 'alt', 'title', 'width', 'height', 'loading'],
+        'div' => ['class'],
+        'span' => ['class'],
+        'p' => ['class'],
+        'ul' => ['class'],
+        'ol' => ['class'],
+        'li' => ['class'],
+        'pre' => ['class'],
+        'code' => ['class'],
+        'blockquote' => ['class'],
+    ];
+
+    if (!class_exists('DOMDocument')) {
+        return strip_tags($html, '<p><br><strong><b><em><i><u><ul><ol><li><a><img><div><span><code><pre><blockquote>');
+    }
+
+    $prev = libxml_use_internal_errors(true);
+    $dom = new DOMDocument('1.0', 'UTF-8');
+    $wrapperId = '__inst_root__';
+    $ok = $dom->loadHTML(
+        '<?xml encoding="UTF-8"><div id="' . $wrapperId . '">' . $html . '</div>',
+        LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD
+    );
+    if (!$ok) {
+        libxml_clear_errors();
+        libxml_use_internal_errors($prev);
+        return '';
+    }
+
+    $root = $dom->getElementById($wrapperId);
+    if (!$root) {
+        libxml_clear_errors();
+        libxml_use_internal_errors($prev);
+        return '';
+    }
+
+    $sanitizeNode = function (DOMNode $node) use (&$sanitizeNode, $allowedTags, $allowedAttrs) {
+        for ($child = $node->firstChild; $child !== null;) {
+            $next = $child->nextSibling;
+            if ($child instanceof DOMElement) {
+                $tag = strtolower($child->tagName);
+                if (!in_array($tag, $allowedTags, true)) {
+                    while ($child->firstChild) {
+                        $node->insertBefore($child->firstChild, $child);
+                    }
+                    $node->removeChild($child);
+                    $child = $next;
+                    continue;
+                }
+
+                $keepAttrs = $allowedAttrs[$tag] ?? [];
+                $toRemove = [];
+                if ($child->hasAttributes()) {
+                    foreach ($child->attributes as $attr) {
+                        $name = strtolower($attr->name);
+                        $val = trim((string) $attr->value);
+                        if (str_starts_with($name, 'on')) {
+                            $toRemove[] = $attr->name;
+                            continue;
+                        }
+                        if (!in_array($name, $keepAttrs, true)) {
+                            $toRemove[] = $attr->name;
+                            continue;
+                        }
+                        if (($name === 'href' || $name === 'src')
+                            && !preg_match('#^(https?:|mailto:|tel:|/|#|data:image/)#i', $val)) {
+                            $toRemove[] = $attr->name;
+                            continue;
+                        }
+                        if ($name === 'target' && !in_array(strtolower($val), ['_blank', '_self'], true)) {
+                            $toRemove[] = $attr->name;
+                            continue;
+                        }
+                    }
+                }
+                foreach ($toRemove as $n) {
+                    $child->removeAttribute($n);
+                }
+                if ($tag === 'a' && strtolower((string) $child->getAttribute('target')) === '_blank') {
+                    $child->setAttribute('rel', 'noopener noreferrer');
+                }
+                if ($tag === 'img' && !$child->hasAttribute('loading')) {
+                    $child->setAttribute('loading', 'lazy');
+                }
+            }
+            $sanitizeNode($child);
+            $child = $next;
+        }
+    };
+    $sanitizeNode($root);
+
+    $out = '';
+    foreach ($root->childNodes as $n) {
+        $out .= $dom->saveHTML($n);
+    }
+    libxml_clear_errors();
+    libxml_use_internal_errors($prev);
+    return trim((string) $out);
+}
+
 /**
  * Appel API robuste
  * @return array{error:bool,httpCode:int,message:string,data:mixed,headers?:array}
@@ -264,6 +468,11 @@ function callApi(string $method, string $endpoint, ?array $data = null, bool $wi
     $url = rtrim($API_BASE, '/') . $endpoint;
     $ch = curl_init($url);
     $headers = ['Content-Type: application/json'];
+    $headers[] = 'X-App-Context: ' . api_call_context($endpoint);
+    if (!empty($_SESSION['username'])) {
+        $safeUser = preg_replace('/[\r\n]+/', '', (string) $_SESSION['username']);
+        $headers[] = 'X-App-User: ' . $safeUser;
+    }
     if ($API_SHARED_SECRET !== '')
         $headers[] = 'X-Internal-Auth: ' . $API_SHARED_SECRET;
     $opts = [
@@ -418,6 +627,23 @@ function fetch_ou_tree(?string $baseDn = ''): array
         return [];
     return $r['data']; // { baseDn, nodes: [...] }
 }
+function fetch_ad_meta(): array
+{
+    $r = callApi('GET', '/meta/ad');
+    if ($r['error'] || !is_array($r['data']))
+        return [];
+    return $r['data'];
+}
+function fetch_ad_explorer_tree(?string $baseDn = ''): array
+{
+    $q = '/tree?depth=6&includeLeaves=true&maxChildren=2000';
+    if ($baseDn)
+        $q .= '&baseDn=' . rawurlencode($baseDn);
+    $r = callApi('GET', $q);
+    if ($r['error'] || !is_array($r['data']))
+        return [];
+    return $r['data'];
+}
 function flatten_ou_nodes(array $treeOrNodes, string $prefix = ''): array
 {
     $out = [];
@@ -459,12 +685,46 @@ function render_ad_tree_nodes(array $nodes): void
         $name = htmlspecialchars((string)($n['name'] ?? ($n['dn'] ?? '')), ENT_QUOTES);
         $type = strtolower((string)($n['type'] ?? 'other'));
         $typeEsc = htmlspecialchars($type, ENT_QUOTES);
+        $samEsc = htmlspecialchars((string) ($n['samAccountName'] ?? ''), ENT_QUOTES);
+        $desc = (string) ($n['description'] ?? '');
+        $descEsc = htmlspecialchars($desc, ENT_QUOTES);
+        $objectClasses = $n['objectClasses'] ?? [];
+        if (!is_array($objectClasses))
+            $objectClasses = [];
+        $ocLower = array_map(static fn($v) => mb_strtolower((string) $v), $objectClasses);
+        if (in_array('computer', $ocLower, true)) {
+            // Priorité absolue : si la classe computer est présente, c'est un PC.
+            $type = 'computer';
+            $typeEsc = htmlspecialchars($type, ENT_QUOTES);
+        } elseif ($type === 'other') {
+            $dnRaw = (string) ($n['dn'] ?? '');
+            $dnUp = strtoupper($dnRaw);
+            if (in_array('group', $ocLower, true)) {
+                $type = 'group';
+            } elseif (in_array('inetorgperson', $ocLower, true)) {
+                $type = 'inetorgperson';
+            } elseif (in_array('computer', $ocLower, true)) {
+                $type = 'computer';
+            } elseif (in_array('user', $ocLower, true)) {
+                $type = 'user';
+            } elseif (in_array('organizationalunit', $ocLower, true) || str_starts_with($dnUp, 'OU=')) {
+                $type = 'ou';
+            } elseif (in_array('container', $ocLower, true) || str_starts_with($dnUp, 'CN=')) {
+                $type = 'container';
+            } elseif (str_starts_with($dnUp, 'DC=')) {
+                $type = 'domain';
+            }
+            $typeEsc = htmlspecialchars($type, ENT_QUOTES);
+        }
+        $classesEsc = htmlspecialchars(implode(', ', array_map('strval', $objectClasses)), ENT_QUOTES);
         $labelType = $type === 'user' ? 'Utilisateur'
             : ($type === 'group' ? 'Groupe'
-            : ($type === 'ou' || $type === 'domain' ? 'Conteneur' : ucfirst($type)));
+            : ($type === 'computer' ? 'Ordinateur'
+            : ($type === 'inetorgperson' ? 'Personne'
+            : ($type === 'ou' || $type === 'domain' || $type === 'container' ? 'Conteneur' : ucfirst($type)))));
 
         echo '<li>';
-        echo '<button type="button" class="ad-node" data-dn="' . $dn . '" data-type="' . $typeEsc . '" data-name="' . $name . '">';
+        echo '<button type="button" class="ad-node" data-dn="' . $dn . '" data-type="' . $typeEsc . '" data-name="' . $name . '" data-sam="' . $samEsc . '" data-description="' . $descEsc . '" data-classes="' . $classesEsc . '">';
         echo '<span class="ad-node-dot"></span>';
         echo '<span class="ad-node-label">' . $name . '</span>';
         echo '<span class="badge subtle">' . htmlspecialchars($labelType, ENT_QUOTES) . '</span>';
@@ -476,6 +736,96 @@ function render_ad_tree_nodes(array $nodes): void
         echo '</li>';
     }
     echo '</ul>';
+}
+
+function sort_ad_tree_nodes(array $nodes, string $sortBy = 'name', string $sortDir = 'asc'): array
+{
+    $dir = strtolower($sortDir) === 'desc' ? -1 : 1;
+    usort($nodes, function (array $a, array $b) use ($sortBy, $dir): int {
+        $av = '';
+        $bv = '';
+        if ($sortBy === 'type') {
+            $av = mb_strtolower((string) ($a['type'] ?? 'other'));
+            $bv = mb_strtolower((string) ($b['type'] ?? 'other'));
+        } elseif ($sortBy === 'dn') {
+            $av = mb_strtolower((string) ($a['dn'] ?? ''));
+            $bv = mb_strtolower((string) ($b['dn'] ?? ''));
+        } else {
+            $av = mb_strtolower((string) ($a['name'] ?? ($a['dn'] ?? '')));
+            $bv = mb_strtolower((string) ($b['name'] ?? ($b['dn'] ?? '')));
+        }
+        $cmp = $av <=> $bv;
+        return $cmp * $dir;
+    });
+    foreach ($nodes as &$n) {
+        if (!empty($n['children']) && is_array($n['children'])) {
+            $n['children'] = sort_ad_tree_nodes($n['children'], $sortBy, $sortDir);
+        }
+    }
+    unset($n);
+    return $nodes;
+}
+
+function tree_node_matches_query(array $n, string $q, string $typeFilter): bool
+{
+    $q = mb_strtolower(trim($q));
+    $type = mb_strtolower((string) ($n['type'] ?? 'other'));
+    $ocLower = array_map(
+        static fn($v) => mb_strtolower((string) $v),
+        (array) ($n['objectClasses'] ?? [])
+    );
+
+    if ($typeFilter !== '' && $typeFilter !== 'all') {
+        $typeMatches = match ($typeFilter) {
+            // En AD réel, beaucoup d'utilisateurs portent aussi la classe inetOrgPerson.
+            // Les objets computer héritent souvent de user -> on les exclut explicitement ici.
+            'user' => (
+                in_array($type, ['user', 'inetorgperson'], true)
+                || (
+                    !in_array($type, ['computer', 'group', 'ou', 'container', 'domain'], true)
+                    && in_array('computer', $ocLower, true) === false
+                    && (
+                        in_array('user', $ocLower, true)
+                        || in_array('inetorgperson', $ocLower, true)
+                    )
+                )
+            ),
+            'inetorgperson' => $type === 'inetorgperson' || in_array('inetorgperson', $ocLower, true),
+            'ou' => $type === 'ou' || in_array('organizationalunit', $ocLower, true),
+            'container' => $type === 'container' || in_array('container', $ocLower, true) || in_array('builtindomain', $ocLower, true),
+            'group' => $type === 'group' || in_array('group', $ocLower, true),
+            'computer' => $type === 'computer' || in_array('computer', $ocLower, true),
+            'domain' => $type === 'domain' || in_array('domaindns', $ocLower, true),
+            default => $type === $typeFilter,
+        };
+        if (!$typeMatches) {
+            return false;
+        }
+    }
+    if ($q === '') {
+        return true;
+    }
+    $hay = mb_strtolower((string) (($n['name'] ?? '') . ' ' . ($n['dn'] ?? '') . ' ' . implode(' ', (array) ($n['objectClasses'] ?? []))));
+    return str_contains($hay, $q);
+}
+
+function filter_tree_with_ancestors(array $nodes, string $query, string $typeFilter): array
+{
+    $out = [];
+    foreach ($nodes as $n) {
+        $children = [];
+        if (!empty($n['children']) && is_array($n['children'])) {
+            $children = filter_tree_with_ancestors($n['children'], $query, $typeFilter);
+        }
+        $match = tree_node_matches_query($n, $query, $typeFilter);
+        if ($match || !empty($children)) {
+            $copy = $n;
+            $copy['children'] = $children;
+            $copy['hasChildren'] = !empty($children) || !empty($n['hasChildren']);
+            $out[] = $copy;
+        }
+    }
+    return $out;
 }
 
 // --- Flash messages + PRG ---
@@ -806,6 +1156,9 @@ function app_pdo(): PDO
         ]);
     } else {
         // SQLite
+        if (!extension_loaded('pdo_sqlite') && !extension_loaded('sqlite3')) {
+            throw new RuntimeException('SQLite driver not available: please enable or install sqlite3 (pdo_sqlite).');
+        }
         $path = $CFG['DB_PATH'] ?? (__DIR__ . '/intranet.sqlite');
         $isNew = !file_exists($path);
         $pdo = new PDO('sqlite:' . $path, null, null, [
@@ -1059,10 +1412,34 @@ try {
 =================================== */
 // Déconnexion
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'logout' && csrf_ok($_POST['csrf'] ?? '')) {
-    session_unset();
-    session_destroy();
+    intra_sync_invalidate();
     header('Location: intranet.php');
     exit;
+}
+
+// Vérification clé de synchronisation pour les sessions authentifiées
+if (isset($_SESSION['username'])) {
+    $cookieKey = $_COOKIE[INTRANET_KEY_COOKIE] ?? '';
+    $sessionKey = $_SESSION['_key'] ?? '';
+    if ($sessionKey === '') {
+        intra_sync_invalidate();
+        header('Location: intranet.php');
+        exit;
+    }
+    // Tolérance contrôlée: si le cookie sync est absent mais la session a une clé,
+    // on resynchronise une fois (utile après certaines transitions navigateur/proxy).
+    if ($cookieKey === '') {
+        setcookie(INTRANET_KEY_COOKIE, $sessionKey, intra_sync_key_cookie_params($sessionLifetime));
+        $cookieKey = $sessionKey;
+    }
+    if (!hash_equals($sessionKey, $cookieKey)) {
+        intra_sync_invalidate();
+        header('Location: intranet.php');
+        exit;
+    }
+    $newKey = intra_sync_key_generate();
+    $_SESSION['_key'] = $newKey;
+    setcookie(INTRANET_KEY_COOKIE, $newKey, intra_sync_key_cookie_params($sessionLifetime));
 }
 
 $uiError = '';
@@ -1152,6 +1529,9 @@ if (!isset($_SESSION['username']) && $_SERVER['REQUEST_METHOD'] === 'POST' && ($
     $_SESSION['user_info'] = $r['data']['user'] ?? [];
     $_SESSION['is_admin'] = (bool) ($r['data']['isAdmin'] ?? false);
     $_SESSION['mustChangePassword'] = (bool) ($r['data']['mustChangePassword'] ?? false);
+    $newKey = intra_sync_key_generate();
+    $_SESSION['_key'] = $newKey;
+    setcookie(INTRANET_KEY_COOKIE, $newKey, intra_sync_key_cookie_params($sessionLifetime));
     flash_set('ui', 'ok', "Connecté.");
     redirect_get([], 'profil');
 }
@@ -1343,6 +1723,122 @@ $canBy = function (array $required) use ($is_admin, $userCnGroups): bool {
 $canUserAdmin = $canBy($ADM_USER_GROUPS);
 $canDomainAdmin = $canBy($ADM_DOMAIN_GROUPS);
 
+// Endpoint AJAX local pour détails explorateur (évite d'exposer le secret API au navigateur)
+if (
+    isset($_GET['ajax'])
+    && $_GET['ajax'] === 'explorer_object'
+    && isset($_SESSION['username'])
+    && $canDomainAdmin
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    $dn = trim((string) ($_GET['dn'] ?? ''));
+    if ($dn === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'dn requis']);
+        exit;
+    }
+    $r = callApi('GET', '/explorer/object?dn=' . rawurlencode($dn));
+    if (!empty($r['error'])) {
+        http_response_code((int) ($r['httpCode'] ?: 500));
+        echo json_encode(['error' => api_err_detail($r, 'Erreur de lecture objet AD')]);
+        exit;
+    }
+    echo json_encode($r['data'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (
+    isset($_GET['ajax'])
+    && $_GET['ajax'] === 'search_groups'
+    && isset($_SESSION['username'])
+    && $canDomainAdmin
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    $q = trim((string) ($_GET['q'] ?? ''));
+    $scope = trim((string) ($_GET['scope'] ?? 'all'));
+    $endpoint = '/explorer/group-search?q=' . rawurlencode($q === '' ? '*' : $q) . '&scope=' . rawurlencode($scope) . '&max=50';
+    $r = callApi('GET', $endpoint);
+    if (!empty($r['error'])) {
+        http_response_code((int) ($r['httpCode'] ?: 500));
+        echo json_encode(['error' => api_err_detail($r, 'Erreur de recherche de groupes')]);
+        exit;
+    }
+    $rows = [];
+    foreach ((array) (($r['data']['results'] ?? $r['data']) ?? []) as $g) {
+        $rows[] = [
+            'dn' => (string) ($g['dn'] ?? ''),
+            'name' => (string) ($g['name'] ?? ''),
+            'sam' => (string) ($g['sam'] ?? ''),
+        ];
+    }
+    echo json_encode(['groups' => $rows], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (
+    isset($_GET['ajax'])
+    && $_GET['ajax'] === 'user_groups'
+    && isset($_SESSION['username'])
+    && $canDomainAdmin
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    $user = trim((string) ($_GET['user'] ?? ''));
+    if ($user === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'user requis']);
+        exit;
+    }
+    $r = callApi('GET', '/explorer/user-groups?user=' . rawurlencode($user));
+    if (!empty($r['error'])) {
+        http_response_code((int) ($r['httpCode'] ?: 500));
+        echo json_encode(['error' => api_err_detail($r, 'Erreur de lecture des groupes utilisateur')]);
+        exit;
+    }
+    echo json_encode($r['data'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (
+    isset($_GET['ajax'])
+    && $_GET['ajax'] === 'search_users'
+    && isset($_SESSION['username'])
+    && $canDomainAdmin
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    $q = trim((string) ($_GET['q'] ?? ''));
+    $r = callApi('GET', '/explorer/user-search?q=' . rawurlencode($q === '' ? '*' : $q) . '&max=50');
+    if (!empty($r['error'])) {
+        http_response_code((int) ($r['httpCode'] ?: 500));
+        echo json_encode(['error' => api_err_detail($r, 'Erreur de recherche utilisateurs')]);
+        exit;
+    }
+    echo json_encode($r['data'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (
+    isset($_GET['ajax'])
+    && $_GET['ajax'] === 'group_members'
+    && isset($_SESSION['username'])
+    && $canDomainAdmin
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    $group = trim((string) ($_GET['group'] ?? ''));
+    if ($group === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'group requis']);
+        exit;
+    }
+    $r = callApi('GET', '/explorer/group-members?group=' . rawurlencode($group));
+    if (!empty($r['error'])) {
+        http_response_code((int) ($r['httpCode'] ?: 500));
+        echo json_encode(['error' => api_err_detail($r, 'Erreur de lecture des membres du groupe')]);
+        exit;
+    }
+    echo json_encode($r['data'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 
 /* ================================
    Données d’affichage
@@ -1366,25 +1862,60 @@ $forcePwMode = isset($_SESSION['username']) && $mustChange;
 /* ================================
    Admin — traitement opérations (PRG)
 =================================== */
-$groupQuery = '';
-$groupResults = [];
-
 /* Précharger options OU (sélection) pour create/move + arbre complet pour l'explorateur AD */
 $ouOptions = [];
 $adTree = [];
+$adMeta = [];
+$explorerQuery = trim((string) ($_GET['exq'] ?? ''));
+$explorerTypeFilter = in_array((string) ($_GET['extype'] ?? 'all'), ['all', 'user', 'group', 'computer', 'ou', 'container', 'inetorgperson', 'domain'], true)
+    ? (string) ($_GET['extype'] ?? 'all')
+    : 'all';
+$explorerTreeSortBy = in_array((string) ($_GET['tree_sort'] ?? 'dn'), ['name', 'type', 'dn'], true)
+    ? (string) ($_GET['tree_sort'] ?? 'dn')
+    : 'dn';
+$explorerTreeSortDir = in_array((string) ($_GET['tree_dir'] ?? 'asc'), ['asc', 'desc'], true)
+    ? (string) ($_GET['tree_dir'] ?? 'asc')
+    : 'asc';
 if ($is_admin) {
-    $userDn = (string) ($userInfo['dn'] ?? '');
-    $rootDn = $userDn ? extract_root_dn($userDn) : '';
-
-    $tree = $rootDn ? fetch_ou_tree($rootDn) : fetch_ou_tree('');
+    $adMeta = fetch_ad_meta();
+    $explorerBaseDn = trim((string) ($adMeta['baseDn'] ?? ''));
+    $tree = $explorerBaseDn !== '' ? fetch_ad_explorer_tree($explorerBaseDn) : fetch_ad_explorer_tree('');
+    $adTree = $tree;
+    if (!empty($adTree['nodes']) && is_array($adTree['nodes'])) {
+        $adTree['nodes'] = sort_ad_tree_nodes($adTree['nodes'], $explorerTreeSortBy, $explorerTreeSortDir);
+        if ($explorerQuery !== '' || $explorerTypeFilter !== 'all') {
+            $adTree['nodes'] = filter_tree_with_ancestors($adTree['nodes'], $explorerQuery, $explorerTypeFilter);
+        }
+    }
     $ouOptions = flatten_ou_nodes($tree);
-
     if (!$ouOptions) {
-        $tree2 = fetch_ou_tree('');
+        $tree2 = fetch_ou_tree($explorerBaseDn);
         $ouOptions = flatten_ou_nodes($tree2);
-        $adTree = $tree2;
-    } else {
-        $adTree = $tree;
+    }
+    if ($explorerBaseDn !== '') {
+        $hasRoot = false;
+        foreach ($ouOptions as $opt) {
+            if (strcasecmp((string) ($opt['dn'] ?? ''), $explorerBaseDn) === 0) {
+                $hasRoot = true;
+                break;
+            }
+        }
+        if (!$hasRoot) {
+            array_unshift($ouOptions, [
+                'dn' => $explorerBaseDn,
+                'label' => 'Racine',
+                'kind' => 'domain',
+                'desc' => 'BaseDn actif'
+            ]);
+        } else {
+            foreach ($ouOptions as &$opt) {
+                if (strcasecmp((string) ($opt['dn'] ?? ''), $explorerBaseDn) === 0) {
+                    $opt['label'] = 'Racine';
+                    break;
+                }
+            }
+            unset($opt);
+        }
     }
 }
 
@@ -1399,6 +1930,7 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
     // actions “Administration utilisateurs” (+ recherche groupes fiche user + gestion outils)
     $USER_ADMIN_ACTIONS = [
         'create_user',
+        'clone_user',
         'admin_reset_pw',
         'admin_update_user',
         'enable_user',
@@ -1406,12 +1938,10 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
         'unlock_user',
         'rename_user_cn',
         'move_user_ou',
-        'add_to_group',
-        'remove_from_group',
+        'set_user_groups',
+        'set_group_members',
         'delete_user',
         'bulk_users',
-        'search_groups_user',
-        'search_groups',
         'tool_save',
         'tool_delete',
         'tool_move'
@@ -1439,18 +1969,6 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
     // Toujours préparer la sélection persistée pour rester sur le bon utilisateur après redirection
     $persistSam = trim((string) ($_POST['persist_selected_sam'] ?? ''));
     $qsSel = $persistSam !== '' ? ['select_sam' => $persistSam] : [];
-
-    // --- Recherche groupe (PRG -> redirige avec gq en GET) ---
-    if ($act === 'search_groups') {
-        $groupQuery = trim((string) ($_POST['group_query'] ?? ''));
-        // Si * (ou vide), on encode * pour obtenir "tout"
-        $gq = ($groupQuery === '' ? '*' : $groupQuery);
-        // On gère aussi pagination via GET (gp/gps)
-        $gp = max(1, (int) ($_POST['gp'] ?? 1));
-        $gps = max(1, (int) ($_POST['gps'] ?? 50));
-        $qs = array_merge($qsSel, ['gq' => $gq, 'gp' => $gp, 'gps' => $gps]);
-        redirect_get(array_merge($qsSel, ['gqU' => $gq, 'gpU' => $gp, 'gpsU' => $gps]), 'admin-domain', 'groups_user');
-    }
 
     // --- Créer utilisateur ---
     if ($act === 'create_user') {
@@ -1527,6 +2045,162 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
             $msg .= " (changement de mot de passe requis au premier logon)";
         flash_set('admin', 'ok', $msg);
         redirect_get([], 'admin-users', 'create_user');
+    }
+
+    // --- Cloner utilisateur (copie attributs + nouveau compte) ---
+    if ($act === 'clone_user') {
+        $source = trim((string) ($_POST['clone_source_sam'] ?? ''));
+        $ouDn = trim((string) ($_POST['clone_ouDn'] ?? ''));
+        $cn = trim((string) ($_POST['clone_cn'] ?? ''));
+        $sam = trim((string) ($_POST['clone_sam'] ?? ''));
+        $gn = trim((string) ($_POST['clone_givenName'] ?? ''));
+        $snv = trim((string) ($_POST['clone_sn'] ?? ''));
+        $upn = trim((string) ($_POST['clone_userPrincipalName'] ?? ''));
+        $mailn = trim((string) ($_POST['clone_mail'] ?? ''));
+        $pwd = (string) ($_POST['clone_password'] ?? '');
+        $mustChange = !empty($_POST['clone_must_change_at_first_login']);
+        $applyGroups = !empty($_POST['clone_apply_groups']);
+        $cloneGroupsRaw = (string) ($_POST['clone_groups_raw'] ?? '');
+        $cloneGroupsJson = (string) ($_POST['clone_groups_json'] ?? '');
+        $cloneExpNever = !empty($_POST['clone_exp_never']);
+        $cloneExpDate = trim((string) ($_POST['clone_exp_date'] ?? ''));
+        $cloneExpTime = trim((string) ($_POST['clone_exp_time'] ?? ''));
+        $cloneExpIso = build_iso_expiry($cloneExpDate, $cloneExpTime);
+
+        if ($source === '' || $ouDn === '' || $cn === '' || $sam === '' || $gn === '' || $snv === '' || $upn === '' || $pwd === '') {
+            flash_set('admin', 'err', "Clonage: champs requis manquants.");
+            redirect_get([], 'explorer');
+        }
+        if ($mailn !== '' && !filter_var($mailn, FILTER_VALIDATE_EMAIL)) {
+            flash_set('admin', 'err', "Clonage: email invalide.");
+            redirect_get([], 'explorer');
+        }
+        if (!$cloneExpNever && ($cloneExpDate !== '' || $cloneExpTime !== '') && !$cloneExpIso) {
+            flash_set('admin', 'err', "Clonage: date/heure d’expiration invalide.");
+            redirect_get([], 'explorer');
+        }
+
+        $srcInfo = callApi('GET', '/user/' . rawurlencode($source));
+        if ($srcInfo['error'] || !is_array($srcInfo['data'])) {
+            flash_set('admin', 'err', api_err_detail($srcInfo, "Clonage: impossible de lire l’utilisateur source"));
+            redirect_get([], 'explorer');
+        }
+        $src = $srcInfo['data'];
+
+        $createPayload = [
+            'ouDn' => $ouDn,
+            'cn' => $cn,
+            'sam' => $sam,
+            'givenName' => $gn,
+            'sn' => $snv,
+            'userPrincipalName' => $upn,
+            'mail' => $mailn,
+            'password' => $pwd,
+            'enabled' => true,
+        ];
+        if (!empty($src['description'])) {
+            $desc = is_array($src['description']) ? implode("\n", $src['description']) : (string) $src['description'];
+            if (trim($desc) !== '')
+                $createPayload['description'] = $desc;
+        }
+
+        $create = callApi('POST', '/admin/createUser', $createPayload);
+        if ($create['error']) {
+            flash_set('admin', 'err', api_err_detail($create, "Clonage: création échouée"));
+            redirect_get([], 'explorer');
+        }
+
+        if ($mustChange) {
+            callApi('POST', '/admin/changePassword', [
+                'username' => $sam,
+                'newPassword' => $pwd,
+                'mustChangeAtNextLogon' => true
+            ]);
+        }
+        if ($cloneExpNever) {
+            callApi('POST', '/admin/setAccountExpiration', ['user' => $sam, 'never' => true]);
+        } elseif ($cloneExpIso) {
+            callApi('POST', '/admin/setAccountExpiration', ['user' => $sam, 'expiresAt' => $cloneExpIso, 'never' => false]);
+        }
+
+        $newDn = (string) ($create['data']['dn'] ?? '');
+        if ($newDn !== '') {
+            $mods = [];
+            $copyMap = [
+                'telephoneNumber' => $src['telephoneNumber'] ?? '',
+                'streetAddress' => $src['streetAddress'] ?? '',
+                'wWWHomePage' => $src['wwwhomepage'] ?? '',
+            ];
+            foreach ($copyMap as $k => $v) {
+                if (is_array($v))
+                    $v = implode('; ', $v);
+                $v = trim((string) $v);
+                if ($v !== '')
+                    $mods[$k] = $v;
+            }
+            if (!empty($mods)) {
+                callApi('POST', '/user/updateProfile', ['dn' => $newDn, 'modifications' => $mods]);
+            }
+        }
+
+        $groupErrors = 0;
+        if ($applyGroups) {
+            $groupTargets = [];
+            $decoded = json_decode($cloneGroupsJson, true);
+            if (is_array($decoded)) {
+                foreach ($decoded as $g) {
+                    if (is_array($g)) {
+                        $v = trim((string) ($g['dn'] ?? ''));
+                    } else {
+                        $v = trim((string) $g);
+                    }
+                    if ($v !== '') {
+                        $groupTargets[] = $v;
+                    }
+                }
+            }
+            $raw = trim($cloneGroupsRaw);
+            if (empty($groupTargets) && $raw !== '') {
+                $parts = preg_split('/[\r\n,;]+/', $raw) ?: [];
+                foreach ($parts as $p) {
+                    $v = trim((string) $p);
+                    if ($v !== '') {
+                        $groupTargets[] = $v;
+                    }
+                }
+            } else {
+                $srcGroups = $src['memberOf'] ?? [];
+                if (is_string($srcGroups) && trim($srcGroups) !== '') {
+                    $srcGroups = [$srcGroups];
+                } elseif (!is_array($srcGroups)) {
+                    $srcGroups = [];
+                }
+                foreach ($srcGroups as $g) {
+                    $v = trim((string) $g);
+                    if ($v !== '') {
+                        $groupTargets[] = $v;
+                    }
+                }
+            }
+            $groupTargets = array_values(array_unique($groupTargets));
+            $gr = callApi('POST', '/explorer/user-groups/set', ['user' => $sam, 'groups' => $groupTargets]);
+            if (!empty($gr['error'])) {
+                $groupErrors = count($groupTargets);
+            } else {
+                $groupErrors = 0;
+            }
+        }
+
+        $msg = "Utilisateur cloné avec succès.";
+        if ($applyGroups) {
+            if ($groupErrors > 0) {
+                $msg .= " (appartenance groupes: {$groupErrors} échec(s)).";
+            } else {
+                $msg .= " (appartenance groupes appliquée).";
+            }
+        }
+        flash_set('admin', 'ok', $msg);
+        redirect_get([], 'explorer');
     }
 
     // --- Reset mdp (admin) ---
@@ -1681,36 +2355,73 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
         redirect_get($qsSel, 'admin-users', 'user_update');
     }
 
-    // --- Ajouter au groupe ---
-    if ($act === 'add_to_group') {
-        $user = trim((string) ($_POST['user_for_group'] ?? ''));
-        $groupDn = trim((string) ($_POST['group_dn_add'] ?? ''));
-        if ($user === '' || $groupDn === '') {
-            flash_set('admin', 'err', "Champs requis.");
+    // --- Définir la liste finale des groupes utilisateur (nouveau flux unifié) ---
+    if ($act === 'set_user_groups') {
+        $user = trim((string) ($_POST['user_for_groups'] ?? ''));
+        $groupsJson = (string) ($_POST['groups_json'] ?? '[]');
+        if ($user === '') {
+            flash_set('admin', 'err', "Utilisateur requis.");
             redirect_get($qsSel, 'admin-users');
         }
-        $r = callApi('POST', '/admin/addToGroup', ['user' => $user, 'groupDn' => $groupDn]);
-        if ($r['error'])
-            flash_set('admin', 'err', api_err_detail($r, "Ajout au groupe échoué"));
-        else
-            flash_set('admin', 'ok', "Ajouté au groupe.");
-        redirect_get($qsSel, 'admin-users', 'groups_user');
+        $decoded = json_decode($groupsJson, true);
+        $groups = [];
+        if (is_array($decoded)) {
+            foreach ($decoded as $g) {
+                if (is_array($g)) {
+                    $dn = trim((string) ($g['dn'] ?? ''));
+                    if ($dn !== '') {
+                        $groups[] = $dn;
+                    }
+                } else {
+                    $dn = trim((string) $g);
+                    if ($dn !== '') {
+                        $groups[] = $dn;
+                    }
+                }
+            }
+        }
+        $r = callApi('POST', '/explorer/user-groups/set', ['user' => $user, 'groups' => array_values(array_unique($groups))]);
+        if ($r['error']) {
+            flash_set('admin', 'err', api_err_detail($r, "Mise à jour des groupes échouée"));
+        } else {
+            $added = (int) ($r['data']['addedCount'] ?? 0);
+            $removed = (int) ($r['data']['removedCount'] ?? 0);
+            flash_set('admin', 'ok', "Groupes mis à jour (ajoutés: {$added}, retirés: {$removed}).");
+        }
+        redirect_get($qsSel, 'explorer');
     }
 
-    // --- Retirer du groupe ---
-    if ($act === 'remove_from_group') {
-        $user = trim((string) ($_POST['user_for_group'] ?? ''));
-        $group = trim((string) ($_POST['group_dn_remove'] ?? ''));
-        if ($user === '' || $group === '') {
-            flash_set('admin', 'err', "Champs requis.");
-            redirect_get($qsSel, 'admin-users');
+    // --- Définir la liste finale des membres d'un groupe ---
+    if ($act === 'set_group_members') {
+        $group = trim((string) ($_POST['group_for_members'] ?? ''));
+        $membersJson = (string) ($_POST['members_json'] ?? '[]');
+        if ($group === '') {
+            flash_set('admin', 'err', "Groupe requis.");
+            redirect_get([], 'explorer');
         }
-        $r = callApi('POST', '/admin/removeFromGroup', ['user' => $user, 'groupDn' => $group]);
-        if ($r['error'])
-            flash_set('admin', 'err', api_err_detail($r, "Retrait du groupe échoué"));
-        else
-            flash_set('admin', 'ok', "Retiré du groupe.");
-        redirect_get($qsSel, 'admin-users', 'groups_user');
+        $decoded = json_decode($membersJson, true);
+        $members = [];
+        if (is_array($decoded)) {
+            foreach ($decoded as $m) {
+                if (is_array($m)) {
+                    $v = trim((string) ($m['dn'] ?? ($m['sam'] ?? '')));
+                } else {
+                    $v = trim((string) $m);
+                }
+                if ($v !== '') {
+                    $members[] = $v;
+                }
+            }
+        }
+        $r = callApi('POST', '/explorer/group-members/set', ['group' => $group, 'members' => array_values(array_unique($members))]);
+        if ($r['error']) {
+            flash_set('admin', 'err', api_err_detail($r, "Mise à jour des membres échouée"));
+        } else {
+            $added = (int) ($r['data']['addedCount'] ?? 0);
+            $removed = (int) ($r['data']['removedCount'] ?? 0);
+            flash_set('admin', 'ok', "Membres mis à jour (ajoutés: {$added}, retirés: {$removed}).");
+        }
+        redirect_get([], 'explorer');
     }
 
     // --- Supprimer utilisateur (JSON, pas dans l'URL) ---
@@ -1831,6 +2542,8 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
         $dn = trim((string) ($_POST['ou_dn'] ?? ''));
         $newNm = trim((string) ($_POST['ou_new_name'] ?? ''));
         $desc = trim((string) ($_POST['ou_desc_mod'] ?? ''));
+        $currentName = trim((string) ($_POST['ou_current_name'] ?? ''));
+        $currentDesc = trim((string) ($_POST['ou_current_desc'] ?? ''));
         $protSel = $_POST['ou_protected_mod'] ?? ''; // "", "1", "0"
         $descClear = !empty($_POST['ou_desc_clear']);
         $newParent = trim((string) ($_POST['ou_new_parent'] ?? '')); // ⬅️ NOUVEAU
@@ -1841,7 +2554,7 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
         }
 
         $payload = ['OuDn' => $dn];
-        if ($newNm !== '') {
+        if ($newNm !== '' && strcasecmp($newNm, $currentName) !== 0) {
             if (!ou_name_is_valid($newNm)) {
                 flash_set('admin', 'err', "Nom d'OU invalide.");
                 redirect_get([], 'admin-domain', 'ou_manage');
@@ -1852,7 +2565,7 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
         // Description: "" = supprimer, null = ne pas toucher, string = définir
         if ($descClear)
             $payload['Description'] = "";
-        elseif ($desc !== '')
+        elseif ($desc !== '' && $desc !== $currentDesc)
             $payload['Description'] = $desc;
 
         // Protection tri-état
@@ -1947,19 +2660,6 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
         $gp = max(1, (int) ($_POST['gpG'] ?? 1));
         $gps = max(1, (int) ($_POST['gpsG'] ?? 50));
         redirect_get(['gqG' => $gq, 'gpG' => $gp, 'gpsG' => $gps], 'admin-domain');
-    }
-
-    // --- Recherche groupes (fiche utilisateur) ---
-    if ($act === 'search_groups_user') {
-        $q = trim((string) ($_POST['group_query'] ?? ''));
-        $gq = ($q === '' ? '*' : $q);
-        $gp = max(1, (int) ($_POST['gpU'] ?? 1));
-        $gps = max(1, (int) ($_POST['gpsU'] ?? 50));
-        // rester sur l’utilisateur sélectionné
-        $persistSam = trim((string) ($_POST['persist_selected_sam'] ?? ''));
-        $qsSel = $persistSam !== '' ? ['select_sam' => $persistSam] : [];
-        $qs = array_merge($qsSel, ['gqU' => $gq, 'gpU' => $gp, 'gpsU' => $gps]);
-        redirect_get($qs, 'admin-users');
     }
 
     // --- Tools: créer / mettre à jour ---
@@ -2125,26 +2825,7 @@ if ($is_admin && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_ac
 /* ================================
    Admin — sélection via liste (GET)
 =================================== */
-$selectedSam = '';
-$selectedUser = null;
-$selectedDn = '';
-
 if ($is_admin) {
-    if (!empty($_GET['select_sam']))
-        $selectedSam = trim((string) $_GET['select_sam']);
-    elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['persist_selected_sam']))
-        $selectedSam = trim((string) $_POST['persist_selected_sam']);
-
-    if ($selectedSam !== '') {
-        $res = callApi('GET', '/user/' . rawurlencode($selectedSam));
-        if (!$res['error']) {
-            $selectedUser = $res['data'];
-            $selectedDn = (string) ($selectedUser['dn'] ?? '');
-        } else {
-            $adminMsgErr = "Utilisateur introuvable.";
-        }
-    }
-
     // Recherche groupes — carte globale
     if (isset($_GET['gqG'])) {
         $groupQueryGlobal = trim((string) $_GET['gqG']);
@@ -2163,23 +2844,6 @@ if ($is_admin) {
         }
     }
 
-    // Recherche groupes — fiche utilisateur
-    if (isset($_GET['gqU'])) {
-        $groupQueryUser = trim((string) $_GET['gqU']);
-        $gpU = max(1, (int) ($_GET['gpU'] ?? 1));
-        $gpsU = max(1, (int) ($_GET['gpsU'] ?? 50));
-        $endpoint = '/groups?page=' . $gpU . '&pageSize=' . $gpsU;
-        if ($groupQueryUser !== '' && $groupQueryUser !== '*') {
-            $endpoint .= '&search=' . rawurlencode($groupQueryUser);
-        }
-        $gr = callApi('GET', $endpoint, null, true);
-        if (!$gr['error']) {
-            $groupResultsUser = is_array($gr['data']) ? $gr['data'] : [];
-            $groupsHasMoreUser = !empty($gr['headers']['x-has-more']) && strtolower($gr['headers']['x-has-more']) === 'true';
-        } else {
-            $adminMsgErr = $adminMsgErr ?: api_err_detail($gr, "Recherche groupes (utilisateur) échouée");
-        }
-    }
 }
 
 /* ---------- Récupération du flash pour affichage ---------- */
@@ -2196,222 +2860,6 @@ if ($f = flash_take()) {
             $uiError = $f['msg'];
     }
 }
-/* ============================================================
-   PTERODACTYL — Synchronisation (création/mise à jour)
-   - Form HTML à faire toi-même (bouton/outil) :
-       <form method="post">
-         <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-         <input type="hidden" name="action" value="ptero_sync">
-         <label>Mot de passe Pterodactyl</label>
-         <input class="input" type="password" name="ptero_password" required>
-         <button class="btn" type="submit">Synchroniser Pterodactyl</button>
-       </form>
-   - Ce bloc :
-       • lit l’utilisateur AD courant depuis $_SESSION['user_info']
-       • cherche l’utilisateur côté Pterodactyl (external_id = sAMAccountName, fallback email)
-       • le crée si absent, sinon le met à jour (dont mot de passe & langue)
-       • notifie via flash + PRG sur l’onglet “Mon profil”
-   ============================================================ */
-
-# --- Config depuis $CONFIG (avec fallback) ---
-$PTERO_BASE = (string) ($CONFIG['PTERO_BASE'] ?? 'https://game.jbsan.fr');        // https://panel.example.com
-$PTERO_APP_KEY = (string) ($CONFIG['PTERO_APP_KEY'] ?? '');                          // Application API Key
-$PTERO_DEFAULT_LANG = (string) ($CONFIG['PTERO_DEFAULT_LANG'] ?? 'en');                   // ex: en, fr
-$PTERO_INSECURE_SKIP_VERIFY = (bool) ($CONFIG['PTERO_INSECURE_SKIP_VERIFY'] ?? false);          // true en lab uniquement
-$PTERO_EXTERNAL_ID_ATTR = (string) ($CONFIG['PTERO_EXTERNAL_ID_ATTR'] ?? 'sAMAccountName');   // mapping pour external_id
-
-/**
- * Appel API Pterodactyl (Application API)
- * @return array{error:bool,http:int,message:string,data:mixed}
- */
-function ptero_call(string $method, string $path, ?array $json = null): array
-{
-    global $PTERO_BASE, $PTERO_APP_KEY, $PTERO_INSECURE_SKIP_VERIFY;
-    if ($PTERO_BASE === '' || $PTERO_APP_KEY === '') {
-        return ['error' => true, 'http' => 0, 'message' => 'Pterodactyl non configuré', 'data' => null];
-    }
-    $url = rtrim($PTERO_BASE, '/') . '/api/application' . (str_starts_with($path, '/') ? $path : '/' . $path);
-
-    $ch = curl_init($url);
-    $hdr = [
-        'Accept: application/json',
-        'Content-Type: application/json',
-        'Authorization: Bearer ' . $PTERO_APP_KEY,
-        'Cache-Control: no-cache',
-        'Pragma: no-cache',
-    ];
-    $opt = [
-        CURLOPT_CUSTOMREQUEST => $method,
-        CURLOPT_HTTPHEADER => $hdr,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 25,
-        CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_FAILONERROR => false
-    ];
-    if (!is_null($json))
-        $opt[CURLOPT_POSTFIELDS] = json_encode($json, JSON_UNESCAPED_UNICODE);
-    if (stripos($url, 'https://') === 0 && $PTERO_INSECURE_SKIP_VERIFY) {
-        $opt[CURLOPT_SSL_VERIFYPEER] = false;
-        $opt[CURLOPT_SSL_VERIFYHOST] = 0;
-    }
-    curl_setopt_array($ch, $opt);
-    $res = curl_exec($ch);
-    $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    if ($res === false) {
-        $err = curl_error($ch);
-        curl_close($ch);
-        return ['error' => true, 'http' => $http ?: 0, 'message' => "Erreur réseau: $err", 'data' => null];
-    }
-    curl_close($ch);
-    $j = json_decode($res, true);
-    if (!is_array($j))
-        return ['error' => ($http < 200 || $http >= 300), 'http' => $http, 'message' => 'Réponse JSON invalide', 'data' => null];
-
-    // Pterodactyl renvoie souvent un tableau "errors" détaillé
-    $msg = '';
-    if (!empty($j['errors']) && is_array($j['errors'])) {
-        $first = $j['errors'][0];
-        $msg = trim(($first['detail'] ?? '') ?: (($first['meta']['source_field'] ?? '') . ' ' . $first['code'] ?? ''));
-    }
-    return ['error' => ($http < 200 || $http >= 300), 'http' => $http, 'message' => $msg, 'data' => $j];
-}
-
-/** Essaye de récupérer un user par external_id (rapide) */
-function ptero_get_by_external(string $externalId): array
-{
-    $r = ptero_call('GET', '/users/external/' . rawurlencode($externalId));
-    if (!$r['error'] && !empty($r['data']['attributes']['id'])) {
-        return $r['data']['attributes']; // id, uuid, username, email, first_name, last_name, language, ...
-    }
-    return [];
-}
-
-/** Fallback: cherche par email via le filtre */
-function ptero_find_first_by_email(string $email): array
-{
-    $r = ptero_call('GET', '/users?filter[email]=' . rawurlencode($email));
-    if (!$r['error'] && !empty($r['data']) && is_array($r['data'])) {
-        $first = $r['data'][0]['attributes'] ?? [];
-        if (!empty($first['id']))
-            return $first;
-    }
-    return [];
-}
-
-/** Création d’un user côté Pterodactyl */
-function ptero_create_user(array $attrs): array
-{
-    return ptero_call('POST', '/users', $attrs);
-}
-
-/** Mise à jour d’un user (PATCH /users/{id}) */
-function ptero_update_user(int $id, array $attrs): array
-{
-    return ptero_call('PATCH', '/users/' . $id, $attrs);
-}
-
-/** Normalise les attributs à partir de $_SESSION['user_info'] */
-function ptero_build_attrs_from_session(string $password): array
-{
-    global $PTERO_DEFAULT_LANG, $PTERO_EXTERNAL_ID_ATTR;
-    $u = $_SESSION['user_info'] ?? [];
-    $sam = (string) ($u['sAMAccountName'] ?? $_SESSION['username'] ?? '');
-    $upn = (string) ($u['userPrincipalName'] ?? '');
-    $mail = (string) ($u['mail'] ?? ($upn ?: ''));
-    $gn = (string) ($u['givenName'] ?? '');
-    $sn = (string) ($u['sn'] ?? '');
-    $user = $sam !== '' ? $sam : (($upn !== '' ? explode('@', $upn)[0] : '') ?: $_SESSION['username']);
-
-    // external_id = attribut choisi (par défaut sAMAccountName)
-    $external = match ($PTERO_EXTERNAL_ID_ATTR) {
-        'userPrincipalName' => ($upn ?: $sam),
-        'mail', 'email' => ($mail ?: $sam),
-        default => $sam,
-    };
-
-    return [
-        'email' => $mail,
-        'username' => $user,
-        'first_name' => $gn ?: $user,
-        'last_name' => $sn ?: '',
-        'password' => $password,
-        'language' => $PTERO_DEFAULT_LANG ?: 'en',
-        'external_id' => $external ?: $user,
-    ];
-}
-
-/* ---------- ACTION: ptero_sync (PRG) ----------
-   Expects: POST csrf + action=ptero_sync + ptero_password
--------------------------------------------------- */
-if (
-    isset($_SESSION['username']) &&
-    $_SERVER['REQUEST_METHOD'] === 'POST' &&
-    (($_POST['action'] ?? '') === 'ptero_sync')
-) {
-
-    if (!function_exists('csrf_ok') || !csrf_ok($_POST['csrf'] ?? '')) {
-        flash_set('ui', 'err', 'Session expirée.');
-        redirect_get([], 'profil');
-    }
-
-    if ($PTERO_BASE === '' || $PTERO_APP_KEY === '') {
-        flash_set('ui', 'err', 'Pterodactyl non configuré côté intranet.');
-        redirect_get([], 'profil');
-    }
-
-    $plain = (string) ($_POST['ptero_password'] ?? '');
-    if ($plain === '' || strlen($plain) < 8) { // règle simple, ajuste si besoin
-        flash_set('ui', 'err', 'Mot de passe requis (8 caractères mini).');
-        redirect_get([], 'profil');
-    }
-
-    // Récup infos & attributs à pousser
-    $attrs = ptero_build_attrs_from_session($plain);
-    if ($attrs['email'] === '') {
-        flash_set('ui', 'err', "Impossible de synchroniser: email introuvable pour votre compte.");
-        redirect_get([], 'profil');
-    }
-
-    // 1) existe via external_id ?
-    $existing = [];
-    if (!empty($attrs['external_id'])) {
-        $existing = ptero_get_by_external($attrs['external_id']);
-    }
-    // 2) sinon, tente par email
-    if (!$existing && $attrs['email'] !== '') {
-        $existing = ptero_find_first_by_email($attrs['email']);
-    }
-
-    // Nettoie les champs pour l’update (external_id non modifiable en PATCH)
-    $update = $attrs;
-    unset($update['external_id']);
-
-    if ($existing && !empty($existing['id'])) {
-        // UPDATE
-        $rid = (int) $existing['id'];
-        $r = ptero_update_user($rid, $update);
-        if ($r['error']) {
-            $msg = $r['message'] ?: 'mise à jour échouée';
-            flash_set('ui', 'err', "Synchronisation Pterodactyl: $msg");
-        } else {
-            flash_set('ui', 'ok', "Compte Pterodactyl mis à jour.");
-        }
-    } else {
-        // CREATE
-        $r = ptero_create_user($attrs);
-        if ($r['error']) {
-            $msg = $r['message'] ?: 'création échouée';
-            flash_set('ui', 'err', "Synchronisation Pterodactyl: $msg");
-        } else {
-            flash_set('ui', 'ok', "Compte Pterodactyl créé et synchronisé.");
-        }
-    }
-
-    // PRG -> retour onglet profil
-    redirect_get([], 'profil');
-}
-/* ============ Fin bloc Pterodactyl ============ */
-
 /* ================================
    HTML
 =================================== */
@@ -2558,8 +3006,8 @@ if (
         .alert.err { background: rgba(239, 68, 68, .1); border: 1px solid rgba(239, 68, 68, .3); }
 
         .tools {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            display: flex;
+            flex-direction: column;
             gap: 16px;
         }
 
@@ -2649,9 +3097,9 @@ if (
         .page-subtitle { color: var(--sub); font-size: 14px; margin: -0.5rem 0 1.25rem; font-weight: 400; }
 
         /* Explorateur AD */
-        .ad-explorer { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
-        .ad-tree-card { flex:1 1 260px; max-width:360px; }
-        .ad-details-card { flex:2 1 320px; }
+        .ad-explorer { display:grid; grid-template-columns:minmax(360px, 42%) minmax(0, 1fr); gap:16px; align-items:start; }
+        .ad-tree-card { min-width:0; }
+        .ad-details-card { min-width:0; }
         .ad-tree { max-height:540px; overflow:auto; padding:8px; border-radius:12px; background:#020617; border:1px solid var(--border); }
         .ad-tree-list { list-style:none; margin:0; padding-left:4px; }
         .ad-tree-list > li { margin:0; }
@@ -2662,6 +3110,16 @@ if (
         .ad-node-dot { width:7px; height:7px; border-radius:999px; background:#4b5563; flex-shrink:0; }
         .ad-node-label { flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .badge.subtle { background:rgba(30,64,175,.12); color:#93c5fd; border:1px solid rgba(59,130,246,.35); }
+        .ad-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+        .ad-kv { display:grid; grid-template-columns:minmax(120px, 180px) minmax(0, 1fr); gap:8px; margin-top:8px; }
+        .ad-kv code { white-space:pre-wrap; word-break:break-word; }
+        .modal-backdrop { position:fixed; inset:0; background:rgba(2,6,23,.8); z-index:9000; display:none; align-items:center; justify-content:center; padding:16px; }
+        .modal-card { width:min(780px, 96vw); max-height:90vh; overflow:auto; background:var(--bg-elevated); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow); padding:16px; }
+        .modal-head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:12px; }
+        .modal-head h3 { margin:0; }
+        @media (max-width: 1100px) {
+            .ad-explorer { grid-template-columns:1fr; }
+        }
     </style>
     <script>
         // Seul indicateur côté client conservé (déjà visible à l'écran si actif) :
@@ -2749,28 +3207,656 @@ if (
                 toggleOu();
             }
 
-            // Explorateur AD : sélection de nœud et panneau de détails
+            // Explorateur AD : sélection de nœud et panneau de détails + actions contextuelles
             const adTree = document.getElementById('ad-tree');
             const adDetails = document.getElementById('ad-details');
+            const adActions = document.getElementById('ad-actions');
+            const explorerModal = document.getElementById('explorer-modal');
+            const modalTitle = document.getElementById('explorer-modal-title');
+            const modalBody = document.getElementById('explorer-modal-body');
+            let selectedNode = null;
+            let selectedObjectDetails = null;
             if (adTree && adDetails) {
                 adTree.addEventListener('click', (e) => {
                     const node = e.target.closest('.ad-node');
                     if (!node) return;
                     adTree.querySelectorAll('.ad-node').forEach(n => n.classList.remove('selected'));
                     node.classList.add('selected');
+                    selectedNode = node;
                     const dn = node.getAttribute('data-dn') || '';
-                    const type = node.getAttribute('data-type') || '';
+                    const rawType = node.getAttribute('data-type') || '';
                     const name = node.getAttribute('data-name') || '';
+                    const desc = node.getAttribute('data-description') || '';
+                    const classes = node.getAttribute('data-classes') || '';
+                    const type = normalizeNodeType(rawType, classes, dn);
                     const typeLabel = type === 'user' ? 'Utilisateur'
                         : (type === 'group' ? 'Groupe'
-                        : (type === 'ou' || type === 'domain' ? 'Conteneur' : (type || 'Objet')));
+                        : (type === 'computer' ? 'Ordinateur'
+                        : (type === 'inetorgperson' ? 'Personne'
+                        : (type === 'ou' || type === 'domain' || type === 'container' ? 'Conteneur' : (type || 'Objet')))));
                     adDetails.innerHTML =
-                        '<div><div class=\"small\" style=\"opacity:.8;margin-bottom:6px\">Type</div><div><strong>' +
-                        escapeHtml(typeLabel) + '</strong></div></div>' +
-                        '<div style=\"margin-top:10px\"><div class=\"small\" style=\"opacity:.8;margin-bottom:6px\">Nom</div><div>' +
-                        '<code>' + escapeHtml(name || dn) + '</code></div></div>' +
-                        '<div style=\"margin-top:10px\"><div class=\"small\" style=\"opacity:.8;margin-bottom:6px\">DN complet</div><div>' +
-                        '<code>' + escapeHtml(dn) + '</code></div></div>';
+                        '<div class=\"ad-kv\"><div class=\"small\">Type</div><div><strong>' + escapeHtml(typeLabel) + '</strong></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Nom</div><div><code>' + escapeHtml(name || dn) + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">DN complet</div><div><code>' + escapeHtml(dn) + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Classes LDAP</div><div><code>' + escapeHtml(classes || '-') + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Description</div><div>' + escapeHtml(desc || '—') + '</div></div>' +
+                        '<div class=\"small\" style=\"margin-top:10px;opacity:.85\">Chargement des détails avancés...</div>';
+                    renderExplorerActions(type, dn, name);
+                    loadExplorerObjectDetails(dn, type, name);
+                });
+            }
+
+            function normalizeNodeType(rawType, classes, dn) {
+                const c = String(classes || '').toLowerCase();
+                // Priorité absolue : classe computer => PC
+                if (c.includes('computer')) return 'computer';
+                const t = String(rawType || '').trim().toLowerCase();
+                if (t && t !== 'other') return t;
+                const dnU = String(dn || '').toUpperCase();
+                if (c.includes('group')) return 'group';
+                if (c.includes('inetorgperson')) return 'inetorgperson';
+                if (c.includes('user')) return 'user';
+                if (c.includes('organizationalunit') || dnU.startsWith('OU=')) return 'ou';
+                if (c.includes('container') || dnU.startsWith('CN=')) return 'container';
+                if (dnU.startsWith('DC=')) return 'domain';
+                return 'other';
+            }
+
+            function loadExplorerObjectDetails(dn, fallbackType, fallbackName) {
+                selectedObjectDetails = null;
+                fetch('intranet.php?ajax=explorer_object&dn=' + encodeURIComponent(dn), {
+                    credentials: 'same-origin',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (!data || data.error) {
+                            adDetails.innerHTML += '<div class=\"small\" style=\"margin-top:8px;color:#fca5a5\">Détails avancés indisponibles.</div>';
+                            return;
+                        }
+                        selectedObjectDetails = data;
+                        renderExplorerObjectDetails(data, fallbackType, fallbackName, dn);
+                    })
+                    .catch(() => {
+                        adDetails.innerHTML += '<div class=\"small\" style=\"margin-top:8px;color:#fca5a5\">Détails avancés indisponibles.</div>';
+                    });
+            }
+
+            function renderExplorerObjectDetails(data, fallbackType, fallbackName, dn) {
+                const type = normalizeNodeType(data.type || fallbackType, (data.objectClasses || []).join(','), dn);
+                const a = data.attributes || {};
+                const typeLabel = type === 'user' ? 'Utilisateur'
+                    : (type === 'group' ? 'Groupe'
+                    : (type === 'computer' ? 'Ordinateur'
+                    : (type === 'inetorgperson' ? 'Personne'
+                    : (type === 'ou' || type === 'domain' || type === 'container' ? 'Conteneur' : (type || 'Objet')))));
+
+                let html =
+                    '<div class=\"ad-kv\"><div class=\"small\">Type</div><div><strong>' + escapeHtml(typeLabel) + '</strong></div></div>' +
+                    '<div class=\"ad-kv\"><div class=\"small\">Nom</div><div><code>' + escapeHtml(a.name || a.cn || fallbackName || dn) + '</code></div></div>' +
+                    '<div class=\"ad-kv\"><div class=\"small\">DN complet</div><div><code>' + escapeHtml(data.dn || dn) + '</code></div></div>' +
+                    '<div class=\"ad-kv\"><div class=\"small\">Classes LDAP</div><div><code>' + escapeHtml((data.objectClasses || []).join(', ') || '-') + '</code></div></div>' +
+                    '<div class=\"ad-kv\"><div class=\"small\">Description</div><div>' + escapeHtml(a.description || '—') + '</div></div>';
+
+                if (type === 'ou') {
+                    const locked = !!data.protectedOu;
+                    html += '<div class=\"ad-kv\"><div class=\"small\">Protection OU</div><div>' +
+                        (locked ? '🔒 Protégée' : '🔓 Non protégée') + '</div></div>';
+                }
+
+                if (type === 'user' || type === 'inetorgperson') {
+                    html +=
+                        '<div class=\"ad-kv\"><div class=\"small\">sAMAccountName</div><div><code>' + escapeHtml(a.samAccountName || '—') + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">UPN</div><div><code>' + escapeHtml(a.userPrincipalName || '—') + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Email</div><div>' + escapeHtml(a.mail || '—') + '</div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Téléphone</div><div>' + escapeHtml(a.telephoneNumber || '—') + '</div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Adresse</div><div>' + escapeHtml(a.streetAddress || '—') + '</div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Site</div><div>' + escapeHtml(a.website || '—') + '</div></div>';
+                }
+
+                if (type === 'computer') {
+                    const ips = Array.isArray(a.ipAddresses) ? a.ipAddresses : [];
+                    html +=
+                        '<div class=\"ad-kv\"><div class=\"small\">Nom DNS</div><div><code>' + escapeHtml(a.dnsHostName || '—') + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">IP</div><div><code>' + escapeHtml(ips.length ? ips.join(', ') : '—') + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Système</div><div>' + escapeHtml(a.operatingSystem || '—') + '</div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Version OS</div><div>' + escapeHtml(a.operatingSystemVersion || '—') + '</div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Dernier bind machine</div><div><code>' + escapeHtml(a.lastBindAtUtc || '—') + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Ajouté le</div><div><code>' + escapeHtml(a.createdAtUtc || a.whenCreated || '—') + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Dernier utilisateur connecté</div><div><code>' + escapeHtml(a.lastUserConnected || 'non disponible AD standard') + '</code></div></div>' +
+                        '<div class=\"ad-kv\"><div class=\"small\">Géré par</div><div><code>' + escapeHtml(a.managedBy || '—') + '</code></div></div>';
+                }
+
+                const memberOf = Array.isArray(a.memberOf) ? a.memberOf : [];
+                if (memberOf.length > 0) {
+                    const rows = memberOf.slice(0, 20).map(dn => {
+                        const label = shortDnLabel(dn);
+                        return '<div><strong>' + escapeHtml(label) + '</strong><div class=\"small\" style=\"opacity:.75\"><code>' + escapeHtml(dn) + '</code></div></div>';
+                    }).join('');
+                    html += '<div class=\"ad-kv\"><div class=\"small\">Membre de</div><div>' +
+                        rows +
+                        (memberOf.length > 20 ? '<div class=\"small\">... (' + (memberOf.length - 20) + ' autres)</div>' : '') +
+                        '</div></div>';
+                }
+                adDetails.innerHTML = html;
+                renderExplorerActions(type, data.dn || dn, a.samAccountName || fallbackName || dn);
+            }
+
+            function renderExplorerActions(type, dn, name) {
+                if (!adActions) return;
+                const isContainer = ['ou', 'container', 'domain'].includes(type);
+                const isUser = ['user', 'inetorgperson'].includes(type);
+                const isGroup = type === 'group';
+                const buttons = [];
+                if (isContainer) {
+                    buttons.push(btn('Créer un utilisateur', "openExplorerModal('create_user')"));
+                    buttons.push(btn('Créer une OU', "openExplorerModal('create_ou')"));
+                    buttons.push(btn('Créer un groupe', "openExplorerModal('create_group')"));
+                }
+                if (type === 'ou') {
+                    buttons.push(btn('Modifier OU', "openExplorerModal('update_ou')"));
+                    buttons.push(btn('Supprimer OU', "openExplorerModal('delete_ou')"));
+                }
+                if (isUser) {
+                    buttons.push(btn('Modifier utilisateur', "openExplorerModal('admin_update_user')"));
+                    buttons.push(btn('Groupes utilisateur', "openExplorerModal('set_user_groups')"));
+                    buttons.push(btn('Activer', "openExplorerModal('enable_user')"));
+                    buttons.push(btn('Désactiver', "openExplorerModal('disable_user')"));
+                    buttons.push(btn('Déverrouiller', "openExplorerModal('unlock_user')"));
+                    buttons.push(btn('Réinitialiser mot de passe', "openExplorerModal('admin_reset_pw')"));
+                    buttons.push(btn('Renommer CN', "openExplorerModal('rename_user_cn')"));
+                    buttons.push(btn('Déplacer', "openExplorerModal('move_user_ou')"));
+                    buttons.push(btn('Copier utilisateur', "openExplorerModal('clone_user')"));
+                    buttons.push(btn('Supprimer utilisateur', "openExplorerModal('delete_user')"));
+                }
+                if (isGroup) {
+                    buttons.push(btn('Membres du groupe', "openExplorerModal('set_group_members')"));
+                    buttons.push(btn('Supprimer groupe', "openExplorerModal('delete_group')"));
+                }
+                adActions.innerHTML = buttons.length ? buttons.join('') : '<div class=\"small\">Aucune action disponible pour ce type.</div>';
+            }
+
+            function btn(label, onclickCode) {
+                return '<button type=\"button\" class=\"btn sm\" onclick=\"' + onclickCode + '\">' + escapeHtml(label) + '</button>';
+            }
+
+            window.closeExplorerModal = function closeExplorerModal() {
+                if (!explorerModal) return;
+                explorerModal.style.display = 'none';
+                modalBody.innerHTML = '';
+            };
+            window.openExplorerModal = function openExplorerModal(action) {
+                if (!selectedNode || !explorerModal || !modalBody || !modalTitle) return;
+                const dn = selectedNode.getAttribute('data-dn') || '';
+                const name = selectedNode.getAttribute('data-name') || '';
+                const type = selectedNode.getAttribute('data-type') || '';
+                const sam = selectedNode.getAttribute('data-sam') || '';
+                const userId = sam || dn || name;
+                const csrf = <?= json_encode($csrf) ?>;
+                const baseDn = <?= json_encode((string) ($adMeta['baseDn'] ?? '')) ?>;
+                const ouOptionsHtml = <?= json_encode(implode('', array_map(function($opt){ return '<option value=\"'.htmlspecialchars((string)$opt['dn'], ENT_QUOTES).'\">'.htmlspecialchars((string)$opt['label'], ENT_QUOTES).'</option>'; }, $ouOptions))) ?>;
+                modalTitle.textContent = 'Action: ' + action;
+                const hidden = '<input type=\"hidden\" name=\"csrf\" value=\"' + escapeHtml(csrf) + '\"><input type=\"hidden\" name=\"admin_action\" value=\"' + escapeHtml(action) + '\">';
+
+                let formBody = '<div class=\"small\" style=\"margin-bottom:8px\">Objet: <code>' + escapeHtml(name || dn) + '</code></div>';
+                if (action === 'create_ou') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"ou_parent_dn\" value=\"' + escapeHtml(dn) + '\">' +
+                        '<label class=\"label\">Nom OU</label><input class=\"input\" name=\"ou_name\" required>' +
+                        '<label class=\"label\">Description</label><input class=\"input\" name=\"ou_desc\">' +
+                        '<div class=\"row\" style=\"margin-top:8px\"><label class=\"label\" style=\"margin:0\">Protéger</label><input type=\"checkbox\" name=\"ou_protected\" value=\"1\"></div>';
+                } else if (action === 'update_ou') {
+                    const sa = selectedObjectDetails && selectedObjectDetails.attributes ? selectedObjectDetails.attributes : {};
+                    const currentOuName = sa.ou || sa.name || name || '';
+                    const currentOuDesc = sa.description || '';
+                    formBody += hidden + '<input type=\"hidden\" name=\"ou_dn\" value=\"' + escapeHtml(dn) + '\">' +
+                        '<input type=\"hidden\" name=\"ou_current_name\" value=\"' + escapeHtml(currentOuName) + '\">' +
+                        '<input type=\"hidden\" name=\"ou_current_desc\" value=\"' + escapeHtml(currentOuDesc) + '\">' +
+                        '<label class=\"label\">Nom OU</label><input class=\"input\" name=\"ou_new_name\" value=\"' + escapeHtml(currentOuName) + '\">' +
+                        '<label class=\"label\">Description</label><input class=\"input\" name=\"ou_desc_mod\" value=\"' + escapeHtml(currentOuDesc) + '\">' +
+                        '<label class=\"label\">Nouveau parent (optionnel)</label><select class=\"input\" name=\"ou_new_parent\"><option value=\"\">— inchangé —</option>' + ouOptionsHtml + '</select>' +
+                        '<label class=\"label\">Protection</label><select class=\"input\" name=\"ou_protected_mod\"><option value=\"\">Ne pas changer</option><option value=\"1\">Activer</option><option value=\"0\">Désactiver</option></select>';
+                } else if (action === 'delete_ou') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"ou_del_dn\" value=\"' + escapeHtml(dn) + '\">' +
+                        '<div class=\"small\" style=\"color:#fca5a5\">Suppression d’OU non vide/protégée bloquée côté API.</div>';
+                } else if (action === 'create_user') {
+                    formBody += hidden +
+                        '<label class=\"label\">OU cible</label><select class=\"input\" name=\"ouDn\" required><option value=\"\">— choisir —</option>' + ouOptionsHtml + '</select>' +
+                        '<label class=\"label\">CN</label><input class=\"input\" name=\"cn\" required>' +
+                        '<label class=\"label\">sAMAccountName</label><input class=\"input\" name=\"sam\" required>' +
+                        '<label class=\"label\">Prénom</label><input class=\"input\" name=\"givenName\" required>' +
+                        '<label class=\"label\">Nom</label><input class=\"input\" name=\"sn\" required>' +
+                        '<label class=\"label\">UPN</label><input class=\"input\" name=\"userPrincipalName\" required>' +
+                        '<label class=\"label\">Email</label><input class=\"input\" name=\"mail\" type=\"email\">' +
+                        '<label class=\"label\">Mot de passe initial</label><input class=\"input\" name=\"password\" type=\"password\" required>' +
+                        '<label class=\"label\">Expiration du compte</label>' +
+                        '<div class=\"row\" style=\"gap:8px\"><input class=\"input\" type=\"date\" name=\"exp_date\" style=\"max-width:220px\"><input class=\"input\" type=\"time\" name=\"exp_time\" style=\"max-width:160px\"><label class=\"label\" style=\"margin:0 6px 0 10px\">Jamais</label><input type=\"checkbox\" name=\"exp_never\" value=\"1\" checked></div>' +
+                        '<div class=\"row\" style=\"margin-top:8px\"><label class=\"label\" style=\"margin:0\">Forcer changement à la première connexion</label><input type=\"checkbox\" name=\"must_change_at_first_login\" value=\"1\"></div>';
+                } else if (action === 'create_group') {
+                    formBody += hidden +
+                        '<label class=\"label\">OU cible</label><select class=\"input\" name=\"group_ouDn\" required><option value=\"\">— choisir —</option>' + ouOptionsHtml + '</select>' +
+                        '<label class=\"label\">CN groupe</label><input class=\"input\" name=\"group_cn\" required>' +
+                        '<label class=\"label\">sAM (optionnel)</label><input class=\"input\" name=\"group_sam\">';
+                } else if (action === 'enable_user' || action === 'disable_user') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"sam_toggle\" value=\"' + escapeHtml(userId) + '\">';
+                } else if (action === 'unlock_user') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"sam_unlock\" value=\"' + escapeHtml(userId) + '\">';
+                } else if (action === 'admin_reset_pw') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"sam_reset\" value=\"' + escapeHtml(userId) + '\">' +
+                        '<label class=\"label\">Nouveau mot de passe</label><input class=\"input\" name=\"new_password\" type=\"password\" required>' +
+                        '<div class=\"row\" style=\"margin-top:8px\"><label class=\"label\" style=\"margin:0\">Forcer changement au prochain logon</label><input type=\"checkbox\" name=\"must_change\" value=\"1\"></div>';
+                } else if (action === 'admin_update_user') {
+                    const sa = selectedObjectDetails && selectedObjectDetails.attributes ? selectedObjectDetails.attributes : {};
+                    const descValue = Array.isArray(sa.description) ? (sa.description[0] || '') : (sa.description || '');
+                    formBody += hidden +
+                        '<input type=\"hidden\" name=\"dn\" value=\"' + escapeHtml(dn) + '\">' +
+                        '<label class=\"label\">Utilisateur (sAM)</label><input class=\"input\" name=\"sam_mod\" value=\"' + escapeHtml(sa.samAccountName || userId) + '\" required>' +
+                        '<label class=\"label\">Email</label><input class=\"input\" name=\"mail_mod\" type=\"email\" value=\"' + escapeHtml(sa.mail || '') + '\">' +
+                        '<label class=\"label\">Prénom</label><input class=\"input\" name=\"givenName_mod\" value=\"' + escapeHtml(sa.givenName || '') + '\">' +
+                        '<label class=\"label\">Nom</label><input class=\"input\" name=\"sn_mod\" value=\"' + escapeHtml(sa.sn || '') + '\">' +
+                        '<label class=\"label\">Téléphone</label><input class=\"input\" name=\"tel_mod\" value=\"' + escapeHtml(sa.telephoneNumber || '') + '\">' +
+                        '<label class=\"label\">Adresse</label><input class=\"input\" name=\"addr_mod\" value=\"' + escapeHtml(sa.streetAddress || '') + '\">' +
+                        '<label class=\"label\">Site web</label><input class=\"input\" name=\"site_mod\" value=\"' + escapeHtml(sa.wWWHomePage || '') + '\">' +
+                        '<label class=\"label\">Description</label><textarea class=\"input\" name=\"desc_mod\" rows=\"3\" maxlength=\"1024\">' + escapeHtml(descValue) + '</textarea>' +
+                        '<label class=\"label\">Expiration du compte</label>' +
+                        '<div class=\"row\" style=\"gap:8px\"><input class=\"input\" type=\"date\" name=\"exp_date_mod\" style=\"max-width:220px\"><input class=\"input\" type=\"time\" name=\"exp_time_mod\" style=\"max-width:160px\"><label class=\"label\" style=\"margin:0 6px 0 10px\">Jamais expirer</label><input type=\"checkbox\" name=\"exp_never_mod\" value=\"1\"></div>';
+                } else if (action === 'rename_user_cn') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"sam_for_rename\" value=\"' + escapeHtml(userId) + '\">' +
+                        '<label class=\"label\">Nouveau CN</label><input class=\"input\" name=\"new_cn\" required>';
+                } else if (action === 'move_user_ou') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"sam_for_move\" value=\"' + escapeHtml(userId) + '\">' +
+                        '<label class=\"label\">OU cible</label><select class=\"input\" name=\"new_ou_dn\" required><option value=\"\">— choisir —</option>' + ouOptionsHtml + '</select>';
+                } else if (action === 'delete_user') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"del_id\" value=\"' + escapeHtml(userId) + '\">' +
+                        '<div class=\"small\" style=\"color:#fca5a5\">Suppression définitive de l’utilisateur.</div>';
+                } else if (action === 'delete_group') {
+                    formBody += hidden + '<input type=\"hidden\" name=\"group_del_id\" value=\"' + escapeHtml(dn) + '\">' +
+                        '<div class=\"small\" style=\"color:#fca5a5\">Suppression définitive du groupe.</div>';
+                } else if (action === 'clone_user') {
+                    const sa = selectedObjectDetails && selectedObjectDetails.attributes ? selectedObjectDetails.attributes : {};
+                    const srcSam = sa.samAccountName || userId;
+                    const srcGn = sa.givenName || '';
+                    const srcSn = sa.sn || '';
+                    const srcMail = sa.mail || '';
+                    const srcUpn = sa.userPrincipalName || '';
+                    const srcGroups = Array.isArray(sa.memberOf) ? sa.memberOf : [];
+                    const srcGroupsJson = JSON.stringify(srcGroups.map(dn => ({ dn })));
+                    formBody += hidden +
+                        '<input type=\"hidden\" name=\"clone_source_sam\" value=\"' + escapeHtml(srcSam) + '\">' +
+                        '<label class=\"label\">OU cible</label><select class=\"input\" name=\"clone_ouDn\" required><option value=\"\">— choisir —</option>' + ouOptionsHtml + '</select>' +
+                        '<label class=\"label\">CN</label><input class=\"input\" name=\"clone_cn\" required>' +
+                        '<label class=\"label\">sAMAccountName</label><input class=\"input\" name=\"clone_sam\" required>' +
+                        '<label class=\"label\">Prénom</label><input class=\"input\" name=\"clone_givenName\" value=\"' + escapeHtml(srcGn) + '\" required>' +
+                        '<label class=\"label\">Nom</label><input class=\"input\" name=\"clone_sn\" value=\"' + escapeHtml(srcSn) + '\" required>' +
+                        '<label class=\"label\">UPN</label><input class=\"input\" name=\"clone_userPrincipalName\" value=\"' + escapeHtml(srcUpn) + '\" required>' +
+                        '<label class=\"label\">Email</label><input class=\"input\" name=\"clone_mail\" type=\"email\" value=\"' + escapeHtml(srcMail) + '\">' +
+                        '<label class=\"label\">Mot de passe initial</label><input class=\"input\" name=\"clone_password\" type=\"password\" required>' +
+                        '<label class=\"label\">Expiration du compte</label>' +
+                        '<div class=\"row\" style=\"gap:8px\"><input class=\"input\" type=\"date\" name=\"clone_exp_date\" style=\"max-width:220px\"><input class=\"input\" type=\"time\" name=\"clone_exp_time\" style=\"max-width:160px\"><label class=\"label\" style=\"margin:0 6px 0 10px\">Jamais</label><input type=\"checkbox\" name=\"clone_exp_never\" value=\"1\" checked></div>' +
+                        '<div class=\"row\" style=\"margin-top:8px\"><label class=\"label\" style=\"margin:0\">Appliquer appartenance aux groupes</label><input type=\"checkbox\" name=\"clone_apply_groups\" value=\"1\" checked></div>' +
+                        '<input type=\"hidden\" name=\"clone_groups_json\" value=\'' + escapeHtml(srcGroupsJson) + '\'>' +
+                        '<input type=\"hidden\" name=\"clone_groups_raw\" value=\"\">' +
+                        '<div id=\"clone-groups-selected\" class=\"small\" style=\"margin:8px 0\"></div>' +
+                        '<div class=\"row\" style=\"gap:8px\"><input class=\"input\" id=\"clone-group-query\" placeholder=\"Rechercher un groupe\"><button type=\"button\" class=\"btn sm\" id=\"clone-group-search-btn\">Rechercher</button></div>' +
+                        '<div id=\"clone-group-results\" class=\"small\" style=\"margin-top:8px\"></div>' +
+                        '<div class=\"row\" style=\"margin-top:8px\"><label class=\"label\" style=\"margin:0\">Forcer changement à la première connexion</label><input type=\"checkbox\" name=\"clone_must_change_at_first_login\" value=\"1\"></div>';
+                } else if (action === 'set_user_groups') {
+                    formBody += hidden +
+                        '<input type=\"hidden\" name=\"user_for_groups\" value=\"' + escapeHtml(userId) + '\">' +
+                        '<input type=\"hidden\" name=\"groups_json\" value=\"[]\">' +
+                        '<div class=\"small\">Gérez la liste finale des groupes de cet utilisateur, puis cliquez sur Exécuter.</div>' +
+                        '<div id=\"user-groups-selected\" class=\"small\" style=\"margin:8px 0\"></div>' +
+                        '<div class=\"row\" style=\"gap:8px\"><input class=\"input\" id=\"user-group-query\" placeholder=\"Rechercher un groupe\"><button type=\"button\" class=\"btn sm\" id=\"user-group-search-btn\">Rechercher</button></div>' +
+                        '<div id=\"user-group-results\" class=\"small\" style=\"margin-top:8px\"></div>';
+                } else if (action === 'set_group_members') {
+                    formBody += hidden +
+                        '<input type=\"hidden\" name=\"group_for_members\" value=\"' + escapeHtml(dn) + '\">' +
+                        '<input type=\"hidden\" name=\"members_json\" value=\"[]\">' +
+                        '<div class=\"small\">Gérez la liste finale des membres de ce groupe, puis cliquez sur Exécuter.</div>' +
+                        '<div id=\"group-members-selected\" class=\"small\" style=\"margin:8px 0\"></div>' +
+                        '<div class=\"row\" style=\"gap:8px\"><input class=\"input\" id=\"group-member-query\" placeholder=\"Rechercher un utilisateur\"><button type=\"button\" class=\"btn sm\" id=\"group-member-search-btn\">Rechercher</button></div>' +
+                        '<div id=\"group-member-results\" class=\"small\" style=\"margin-top:8px\"></div>';
+                } else {
+                    return;
+                }
+
+                modalBody.innerHTML =
+                    '<form method=\"post\" onsubmit=\"return confirm(\'Confirmer cette action AD ?\')\">' +
+                    formBody +
+                    '<div class=\"row\" style=\"justify-content:flex-end; gap:8px; margin-top:12px\">' +
+                    '<button type=\"button\" class=\"btn\" onclick=\"closeExplorerModal()\">Annuler</button>' +
+                    '<button type=\"submit\" class=\"btn\">Exécuter</button>' +
+                    '</div></form>';
+                if (action === 'create_user') {
+                    const s = modalBody.querySelector('select[name=\"ouDn\"]');
+                    if (s) s.value = dn || baseDn || '';
+                } else if (action === 'create_group') {
+                    const s = modalBody.querySelector('select[name=\"group_ouDn\"]');
+                    if (s) s.value = dn || baseDn || '';
+                } else if (action === 'move_user_ou') {
+                    const s = modalBody.querySelector('select[name=\"new_ou_dn\"]');
+                    if (s) s.value = baseDn || '';
+                } else if (action === 'clone_user') {
+                    const s = modalBody.querySelector('select[name=\"clone_ouDn\"]');
+                    if (s) s.value = baseDn || '';
+                    initCloneGroupsEditor();
+                } else if (action === 'set_user_groups') {
+                    initUserGroupsEditor(userId);
+                } else if (action === 'set_group_members') {
+                    initGroupMembersEditor(dn);
+                } else if (action === 'admin_update_user') {
+                    const sa = selectedObjectDetails && selectedObjectDetails.attributes ? selectedObjectDetails.attributes : {};
+                    const never = !!(sa.accountNeverExpires);
+                    const dateInput = modalBody.querySelector('input[name=\"exp_date_mod\"]');
+                    const timeInput = modalBody.querySelector('input[name=\"exp_time_mod\"]');
+                    const neverInput = modalBody.querySelector('input[name=\"exp_never_mod\"]');
+                    if (neverInput) neverInput.checked = never;
+                    const rawUtc = sa.accountExpiresUtc || sa.accountExpires || '';
+                    if (!never && rawUtc && dateInput && timeInput) {
+                        const dt = new Date(rawUtc);
+                        if (!Number.isNaN(dt.getTime())) {
+                            const p2 = (n) => String(n).padStart(2, '0');
+                            dateInput.value = dt.getFullYear() + '-' + p2(dt.getMonth() + 1) + '-' + p2(dt.getDate());
+                            timeInput.value = p2(dt.getHours()) + ':' + p2(dt.getMinutes());
+                        }
+                    }
+                } else if (action === 'update_ou') {
+                    const s = modalBody.querySelector('select[name=\"ou_new_parent\"]');
+                    if (s) s.value = '';
+                }
+                explorerModal.style.display = 'flex';
+            };
+
+            function initCloneGroupsEditor() {
+                const hidden = modalBody.querySelector('input[name=\"clone_groups_json\"]');
+                const selectedWrap = modalBody.querySelector('#clone-groups-selected');
+                const resultsWrap = modalBody.querySelector('#clone-group-results');
+                const qInput = modalBody.querySelector('#clone-group-query');
+                const btn = modalBody.querySelector('#clone-group-search-btn');
+                if (!hidden || !selectedWrap || !resultsWrap || !qInput || !btn) return;
+
+                let selected = [];
+                try {
+                    const decoded = JSON.parse(hidden.value || '[]');
+                    if (Array.isArray(decoded)) {
+                        selected = decoded
+                            .map(v => (typeof v === 'string' ? { dn: v, name: '' } : v))
+                            .filter(v => v && v.dn);
+                    }
+                } catch (_) { }
+
+                const sync = () => {
+                    hidden.value = JSON.stringify(selected.map(v => ({ dn: v.dn, name: v.name || '' })));
+                    if (selected.length === 0) {
+                        selectedWrap.innerHTML = '<div class=\"small\">Aucun groupe sélectionné.</div>';
+                        return;
+                    }
+                    selectedWrap.innerHTML = selected.map((g, i) =>
+                        '<div class=\"row\" style=\"gap:8px;margin:4px 0\"><button type=\"button\" class=\"btn sm\" data-rm=\"' + i + '\">Retirer</button><code>' + escapeHtml(prettyGroupLabel(g)) + '</code><span class=\"small\" style=\"opacity:.75\">' + escapeHtml(g.dn || '') + '</span></div>'
+                    ).join('');
+                    selectedWrap.querySelectorAll('button[data-rm]').forEach(b => {
+                        b.addEventListener('click', () => {
+                            const idx = parseInt(b.getAttribute('data-rm') || '-1', 10);
+                            if (idx >= 0) {
+                                selected.splice(idx, 1);
+                                sync();
+                            }
+                        });
+                    });
+                };
+
+                const search = () => {
+                    const q = (qInput.value || '').trim();
+                    const endpoint = 'intranet.php?ajax=search_groups&q=' + encodeURIComponent(q || '*');
+                    fetch(endpoint, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+                        .then(r => r.json())
+                        .then(data => {
+                            const rows = Array.isArray(data?.groups) ? data.groups : [];
+                            if (!rows.length) {
+                                resultsWrap.innerHTML = '<div class=\"small\">Aucun groupe trouvé.</div>';
+                                return;
+                            }
+                            resultsWrap.innerHTML = rows.map((g, i) => {
+                                const dn = String(g.dn || '');
+                                const exists = selected.some(s => s.dn.toLowerCase() === dn.toLowerCase());
+                                return '<div class=\"row\" style=\"gap:8px;margin:4px 0\"><button type=\"button\" class=\"btn sm\" data-add=\"' + i + '\" ' + (exists ? 'disabled' : '') + '>Ajouter</button><code>' + escapeHtml(prettyGroupLabel(g)) + '</code><span class=\"small\" style=\"opacity:.75\">' + escapeHtml(dn) + '</span></div>';
+                            }).join('');
+                            resultsWrap.querySelectorAll('button[data-add]').forEach(b => {
+                                b.addEventListener('click', () => {
+                                    const idx = parseInt(b.getAttribute('data-add') || '-1', 10);
+                                    if (idx >= 0 && rows[idx]) {
+                                        const dn = String(rows[idx].dn || '');
+                                        if (dn && !selected.some(s => s.dn.toLowerCase() === dn.toLowerCase())) {
+                                            selected.push({ dn, name: String(rows[idx].name || rows[idx].sam || '') });
+                                            sync();
+                                            search();
+                                        }
+                                    }
+                                });
+                            });
+                        })
+                        .catch(() => {
+                            resultsWrap.innerHTML = '<div class=\"small\" style=\"color:#fca5a5\">Recherche groupes indisponible.</div>';
+                        });
+                };
+
+                btn.addEventListener('click', search);
+                qInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        search();
+                    }
+                });
+                sync();
+            }
+
+            function shortDnLabel(dn) {
+                const raw = String(dn || '');
+                const first = raw.split(',')[0] || raw;
+                return first.replace(/^(CN|OU)=/i, '') || raw;
+            }
+
+            function prettyGroupLabel(g) {
+                const name = String(g?.name || '').trim();
+                const sam = String(g?.sam || '').trim();
+                const dn = String(g?.dn || '').trim();
+                if (name && sam) return `${name} (${sam})`;
+                if (name) return name;
+                if (sam) return sam;
+                return shortDnLabel(dn);
+            }
+
+            function initUserGroupsEditor(userId) {
+                const hidden = modalBody.querySelector('input[name=\"groups_json\"]');
+                const selectedWrap = modalBody.querySelector('#user-groups-selected');
+                const resultsWrap = modalBody.querySelector('#user-group-results');
+                const qInput = modalBody.querySelector('#user-group-query');
+                const btn = modalBody.querySelector('#user-group-search-btn');
+                if (!hidden || !selectedWrap || !resultsWrap || !qInput || !btn) return;
+
+                let selected = [];
+
+                const sync = () => {
+                    hidden.value = JSON.stringify(selected.map(v => ({ dn: v.dn, name: v.name || '', sam: v.sam || '' })));
+                    if (selected.length === 0) {
+                        selectedWrap.innerHTML = '<div class=\"small\">Aucun groupe sélectionné.</div>';
+                        return;
+                    }
+                    selectedWrap.innerHTML = selected.map((g, i) =>
+                        '<div class=\"row\" style=\"gap:8px;margin:4px 0\"><button type=\"button\" class=\"btn sm\" data-rm=\"' + i + '\">Retirer</button><code>' + escapeHtml(prettyGroupLabel(g)) + '</code><span class=\"small\" style=\"opacity:.75\">' + escapeHtml(g.dn || '') + '</span></div>'
+                    ).join('');
+                    selectedWrap.querySelectorAll('button[data-rm]').forEach(b => {
+                        b.addEventListener('click', () => {
+                            const idx = parseInt(b.getAttribute('data-rm') || '-1', 10);
+                            if (idx >= 0) {
+                                selected.splice(idx, 1);
+                                sync();
+                            }
+                        });
+                    });
+                };
+
+                const search = () => {
+                    const q = (qInput.value || '').trim();
+                    const endpoint = 'intranet.php?ajax=search_groups&q=' + encodeURIComponent(q || '*') + '&scope=all';
+                    fetch(endpoint, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+                        .then(r => r.json())
+                        .then(data => {
+                            const rows = Array.isArray(data?.groups) ? data.groups : [];
+                            if (!rows.length) {
+                                resultsWrap.innerHTML = '<div class=\"small\">Aucun groupe trouvé.</div>';
+                                return;
+                            }
+                            resultsWrap.innerHTML = rows.map((g, i) => {
+                                const dn = String(g.dn || '');
+                                const exists = selected.some(s => s.dn.toLowerCase() === dn.toLowerCase());
+                                return '<div class=\"row\" style=\"gap:8px;margin:4px 0\"><button type=\"button\" class=\"btn sm\" data-add=\"' + i + '\" ' + (exists ? 'disabled' : '') + '>Ajouter</button><code>' + escapeHtml(prettyGroupLabel(g)) + '</code><span class=\"small\" style=\"opacity:.75\">' + escapeHtml(dn) + '</span></div>';
+                            }).join('');
+                            resultsWrap.querySelectorAll('button[data-add]').forEach(b => {
+                                b.addEventListener('click', () => {
+                                    const idx = parseInt(b.getAttribute('data-add') || '-1', 10);
+                                    if (idx >= 0 && rows[idx]) {
+                                        const dn = String(rows[idx].dn || '');
+                                        if (dn && !selected.some(s => s.dn.toLowerCase() === dn.toLowerCase())) {
+                                            selected.push({ dn, name: String(rows[idx].name || ''), sam: String(rows[idx].sam || '') });
+                                            sync();
+                                            search();
+                                        }
+                                    }
+                                });
+                            });
+                        })
+                        .catch(() => {
+                            resultsWrap.innerHTML = '<div class=\"small\" style=\"color:#fca5a5\">Recherche groupes indisponible.</div>';
+                        });
+                };
+
+                fetch('intranet.php?ajax=user_groups&user=' + encodeURIComponent(userId), {
+                    credentials: 'same-origin',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                })
+                    .then(r => r.json())
+                    .then(data => {
+                        const groups = Array.isArray(data?.groups) ? data.groups : [];
+                        selected = groups
+                            .map(g => ({ dn: String(g.dn || ''), name: String(g.name || ''), sam: String(g.sam || '') }))
+                            .filter(g => g.dn);
+                        sync();
+                    })
+                    .catch(() => {
+                        selected = [];
+                        sync();
+                    });
+
+                btn.addEventListener('click', search);
+                qInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        search();
+                    }
+                });
+            }
+
+            function prettyUserLabel(u) {
+                const name = String(u?.name || '').trim();
+                const sam = String(u?.sam || '').trim();
+                const upn = String(u?.upn || '').trim();
+                if (name && sam) return `${name} (${sam})`;
+                if (name) return name;
+                if (sam) return sam;
+                if (upn) return upn;
+                return shortDnLabel(String(u?.dn || ''));
+            }
+
+            function initGroupMembersEditor(groupDn) {
+                const hidden = modalBody.querySelector('input[name=\"members_json\"]');
+                const selectedWrap = modalBody.querySelector('#group-members-selected');
+                const resultsWrap = modalBody.querySelector('#group-member-results');
+                const qInput = modalBody.querySelector('#group-member-query');
+                const btn = modalBody.querySelector('#group-member-search-btn');
+                if (!hidden || !selectedWrap || !resultsWrap || !qInput || !btn) return;
+
+                let selected = [];
+
+                const sync = () => {
+                    hidden.value = JSON.stringify(selected.map(v => ({ dn: v.dn, name: v.name || '', sam: v.sam || '', upn: v.upn || '' })));
+                    if (selected.length === 0) {
+                        selectedWrap.innerHTML = '<div class=\"small\">Aucun membre sélectionné.</div>';
+                        return;
+                    }
+                    selectedWrap.innerHTML = selected.map((u, i) =>
+                        '<div class=\"row\" style=\"gap:8px;margin:4px 0\"><button type=\"button\" class=\"btn sm\" data-rm=\"' + i + '\">Retirer</button><code>' + escapeHtml(prettyUserLabel(u)) + '</code><span class=\"small\" style=\"opacity:.75\">' + escapeHtml(u.dn || '') + '</span></div>'
+                    ).join('');
+                    selectedWrap.querySelectorAll('button[data-rm]').forEach(b => {
+                        b.addEventListener('click', () => {
+                            const idx = parseInt(b.getAttribute('data-rm') || '-1', 10);
+                            if (idx >= 0) {
+                                selected.splice(idx, 1);
+                                sync();
+                            }
+                        });
+                    });
+                };
+
+                const search = () => {
+                    const q = (qInput.value || '').trim();
+                    fetch('intranet.php?ajax=search_users&q=' + encodeURIComponent(q || '*'), {
+                        credentials: 'same-origin',
+                        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                    })
+                        .then(r => r.json())
+                        .then(data => {
+                            const rows = Array.isArray(data?.results) ? data.results : [];
+                            if (!rows.length) {
+                                resultsWrap.innerHTML = '<div class=\"small\">Aucun utilisateur trouvé.</div>';
+                                return;
+                            }
+                            resultsWrap.innerHTML = rows.map((u, i) => {
+                                const dn = String(u.dn || '');
+                                const exists = selected.some(s => s.dn.toLowerCase() === dn.toLowerCase());
+                                return '<div class=\"row\" style=\"gap:8px;margin:4px 0\"><button type=\"button\" class=\"btn sm\" data-add=\"' + i + '\" ' + (exists ? 'disabled' : '') + '>Ajouter</button><code>' + escapeHtml(prettyUserLabel(u)) + '</code><span class=\"small\" style=\"opacity:.75\">' + escapeHtml(dn) + '</span></div>';
+                            }).join('');
+                            resultsWrap.querySelectorAll('button[data-add]').forEach(b => {
+                                b.addEventListener('click', () => {
+                                    const idx = parseInt(b.getAttribute('data-add') || '-1', 10);
+                                    if (idx >= 0 && rows[idx]) {
+                                        const dn = String(rows[idx].dn || '');
+                                        if (dn && !selected.some(s => s.dn.toLowerCase() === dn.toLowerCase())) {
+                                            selected.push({ dn, name: String(rows[idx].name || ''), sam: String(rows[idx].sam || ''), upn: String(rows[idx].upn || '') });
+                                            sync();
+                                            search();
+                                        }
+                                    }
+                                });
+                            });
+                        })
+                        .catch(() => {
+                            resultsWrap.innerHTML = '<div class=\"small\" style=\"color:#fca5a5\">Recherche utilisateurs indisponible.</div>';
+                        });
+                };
+
+                fetch('intranet.php?ajax=group_members&group=' + encodeURIComponent(groupDn), {
+                    credentials: 'same-origin',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                })
+                    .then(r => r.json())
+                    .then(data => {
+                        const members = Array.isArray(data?.members) ? data.members : [];
+                        selected = members
+                            .map(u => ({ dn: String(u.dn || ''), name: String(u.name || ''), sam: String(u.sam || ''), upn: String(u.upn || '') }))
+                            .filter(u => u.dn);
+                        sync();
+                    })
+                    .catch(() => {
+                        selected = [];
+                        sync();
+                    });
+
+                btn.addEventListener('click', search);
+                qInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        search();
+                    }
                 });
             }
 
@@ -2836,7 +3922,7 @@ if ($uiError) {
 
                     <?php if ($canUserAdmin): ?>
                         <button class="tab-btn" data-tab="tools" onclick="setActive('tools')">Gestion outils</button>
-                        <button class="tab-btn" data-tab="admin-users" onclick="setActive('admin-users')">Admin utilisateurs</button>
+                        <button class="tab-btn" data-tab="admin-users" onclick="setActive('admin-users')">Liste utilisateurs</button>
                     <?php endif; ?>
                     <?php if ($canDomainAdmin): ?>
                         <button class="tab-btn" data-tab="explorer" onclick="setActive('explorer')">Explorateur AD</button>
@@ -2983,41 +4069,6 @@ if ($uiError) {
                     <?php if (isset($_SESSION['username'])): ?>
                         <h2>Mes outils</h2>
 
-                        <!-- Outil "Pterodactyl" hors BDD -->
-                        <div class="tool">
-                            <img src="https://game.jbsan.fr/assets/svgs/pterodactyl.svg" alt="">
-                            <div>
-                                <div style="font-weight:700">Pterodactyl</div>
-                                <div class="small">Panel de jeux — crée/maj ton compte depuis l’intranet.</div>
-
-                                <!-- Boutons : ouvrir le panel + synchroniser -->
-                                <div class="row" style="margin-top:8px; gap:8px; align-items:center; flex-wrap:wrap">
-                                    <a class="btn sm" target="_blank" rel="noopener noreferrer"
-                                        href="<?= htmlspecialchars($CONFIG['PTERO_BASE'] ?? 'https://ptero.b2akxhct.eu') ?>">
-                                        Ouvrir le panel
-                                    </a>
-
-                                    <!-- Formulaire de synchro (hors BDD) -->
-                                    <form method="post" class="inline" autocomplete="off" novalidate>
-                                        <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                        <input type="hidden" name="action" value="ptero_sync">
-
-                                        <input class="input" type="password" name="ptero_password"
-                                            placeholder="Mot de passe Pterodactyl" autocomplete="new-password" required
-                                            style="max-width:220px">
-
-                                        <button class="btn sm" type="submit">Synchroniser</button>
-                                    </form>
-                                </div>
-
-                                <div class="small" style="margin-top:6px;opacity:.8">
-                                    La synchronisation crée ou met à jour ton compte (email, nom, prénom, mot de passe
-                                    obligatoire depuis "Mon profil").
-                                </div>
-                            </div>
-                        </div>
-
-
                         <?php if (!$hasToolsForUser): ?>
                             <div class="card">
                                 <div class="small">Aucun outil disponible pour votre compte.</div>
@@ -3027,11 +4078,13 @@ if ($uiError) {
                                 <?php
                                 $loginBase = $userInfo['userPrincipalName'] ?? $_SESSION['username'];
                                 foreach ($visibleTools as $t):
+                                    $toolId = (int) ($t['id'] ?? 0);
                                     $title = $t['title'] ?? '';
                                     $desc = $t['description'] ?? '';
                                     $url = $t['url'] ?? '#';
                                     $icon = $t['icon'] ?? '';
                                     $inst = $t['instructions'] ?? '';
+                                    $instSafe = null;
                                     $hintP = $t['login_hint_prefix'] ?? '';
                                     $hintS = $t['login_hint_suffix'] ?? '';
                                     $showH = !empty($t['show_login_hint']);
@@ -3040,22 +4093,49 @@ if ($uiError) {
                                     <div class="tool">
                                         <?php if ($icon): ?><img src="<?= htmlspecialchars($icon) ?>" alt=""><?php endif; ?>
                                         <div>
-                                            <div style="font-weight:700"><?= htmlspecialchars($title) ?></div>
+                                            <div style="font-weight:700;font-size:15px"><?= htmlspecialchars($title) ?></div>
                                             <?php if ($desc): ?>
-                                                <div class="small"><?= htmlspecialchars($desc) ?></div><?php endif; ?>
-                                            <?php if ($inst): ?>
-                                                <div class="small" style="margin-top:6px;opacity:.9"><?= nl2br(htmlspecialchars($inst)) ?>
-                                                </div><?php endif; ?>
+                                                <div class="small" style="margin-top:2px;opacity:.85">
+                                                    <?= htmlspecialchars($desc) ?>
+                                                </div>
+                                            <?php endif; ?>
                                             <?php if ($showH && ($hintP || $hintS)): ?>
                                                 <div class="small" style="margin-top:6px">
                                                     Identifiant attendu&nbsp;:
                                                     <code><?= htmlspecialchars($hintP) ?><strong><?= htmlspecialchars($loginBase) ?></strong><?= htmlspecialchars($hintS) ?></code>
                                                 </div>
                                             <?php endif; ?>
-                                            <div style="margin-top:8px">
+                                            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
                                                 <a class="btn" style="padding:8px 12px" target="_blank" rel="noopener noreferrer"
                                                     href="<?= htmlspecialchars($url) ?>">Ouvrir</a>
+                                                <?php if ($inst): ?>
+                                                    <?php
+                                                    // Autoriser un HTML riche mais sur whitelist stricte.
+                                                    $instSafe = sanitize_tool_instructions_html((string) $inst);
+                                                    ?>
+                                                    <?php if (!empty($instSafe)): ?>
+                                                        <button
+                                                            type="button"
+                                                            class="btn"
+                                                            style="padding:6px 10px;background:transparent;border:1px solid var(--border,#1f2937);color:var(--sub,#9ca3af);font-size:12px"
+                                                            onclick="(function(id,btn){var el=document.getElementById(id);if(!el)return;var open=el.getAttribute('data-open')==='1';el.setAttribute('data-open',open?'0':'1');el.style.display=open?'none':'block';btn.innerText=open?'Instructions':'Masquer les instructions';})('tool-inst-<?= $toolId ?>', this);">
+                                                            Instructions
+                                                        </button>
+                                                    <?php endif; ?>
+                                                <?php endif; ?>
                                             </div>
+                                            <?php if (!empty($instSafe)): ?>
+                                                <div id="tool-inst-<?= $toolId ?>"
+                                                    data-open="0"
+                                                    style="display:none;margin-top:8px;padding:10px 12px;border-radius:10px;border:1px solid #1f2937;background:#020617;max-width:100%;overflow-x:auto">
+                                                    <div class="small" style="font-weight:600;margin-bottom:4px;opacity:.9">
+                                                        Instructions
+                                                    </div>
+                                                    <div class="small" style="opacity:.92;line-height:1.6">
+                                                        <?= $instSafe ?>
+                                                    </div>
+                                                </div>
+                                            <?php endif; ?>
                                         </div>
                                     </div>
                                 <?php endforeach; ?>
@@ -3160,9 +4240,13 @@ if ($uiError) {
                                     <input class="input" type="number" name="sort_order"
                                         value="<?= (int) ($editTool['sort_order'] ?? 1000) ?>">
 
-                                    <label class="label">Instructions</label>
-                                    <textarea class="input" name="instructions"
-                                        rows="3"><?= htmlspecialchars($editTool['instructions'] ?? '') ?></textarea>
+                                    <label class="label">Instructions (HTML ou texte brut)</label>
+                                    <textarea class="input" name="instructions" rows="4"
+                                        placeholder="Ex. :&#10;- Pré-requis de connexion&#10;- Étapes à suivre&#10;Vous pouvez utiliser un sous-ensemble de HTML (&lt;p&gt;, &lt;strong&gt;, &lt;ul&gt;, &lt;li&gt;, &lt;a&gt;...)."><?= htmlspecialchars($editTool['instructions'] ?? '') ?></textarea>
+                                    <div class="small" style="margin-top:4px;opacity:.8">
+                                        Contenu riche autorisé : un sous-ensemble de HTML sera rendu tel quel pour l’utilisateur
+                                        (pas de scripts, uniquement texte et mise en forme).
+                                    </div>
 
                                     <div class="grid" style="grid-template-columns:1fr 1fr; gap:8px">
                                         <div>
@@ -3271,254 +4355,7 @@ if ($uiError) {
                         </div>
 
                         <!-- Fiche utilisateur sélectionné : AU-DESSUS des formulaires généraux -->
-                        <?php
-                        $selectedSam = '';
-                        $selectedUser = null;
-                        $selectedDn = '';
-                        if (!empty($_GET['select_sam']))
-                            $selectedSam = trim((string) $_GET['select_sam']);
-                        elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['persist_selected_sam']))
-                            $selectedSam = trim((string) $_POST['persist_selected_sam']);
-
-                        if ($selectedSam !== '') {
-                            $res = callApi('GET', '/user/' . rawurlencode($selectedSam));
-                            if (!$res['error']) {
-                                $selectedUser = $res['data'];
-                                $selectedDn = (string) ($selectedUser['dn'] ?? '');
-                            } else {
-                                $adminMsgErr = $adminMsgErr ?: "Utilisateur introuvable.";
-                            }
-                        }
-                        $exp = user_expiry_values($selectedUser);
-                        ?>
-
-                        <?php if ($selectedUser):
-                            $prefSam = htmlspecialchars($selectedUser['sAMAccountName'] ?? '', ENT_QUOTES);
-                            $prefDn = htmlspecialchars($selectedDn, ENT_QUOTES);
-                            $prefMail = htmlspecialchars(is_array($selectedUser['mail'] ?? null) ? implode('; ', $selectedUser['mail']) : ($selectedUser['mail'] ?? ''), ENT_QUOTES);
-                            $prefGiv = htmlspecialchars($selectedUser['givenName'] ?? '', ENT_QUOTES);
-                            $prefSn = htmlspecialchars($selectedUser['sn'] ?? '', ENT_QUOTES);
-                            $prefTel = htmlspecialchars(is_array($selectedUser['telephoneNumber'] ?? null) ? implode('; ', $selectedUser['telephoneNumber']) : ($selectedUser['telephoneNumber'] ?? ''), ENT_QUOTES);
-                            $prefAddr = htmlspecialchars($selectedUser['streetAddress'] ?? '', ENT_QUOTES);
-                            $prefSite = htmlspecialchars($selectedUser['wwwhomepage'] ?? '', ENT_QUOTES);
-                            $descRaw = $selectedUser['description'] ?? '';
-                            if (is_array($descRaw))
-                                $descRaw = implode("\n", $descRaw);
-                            $prefDesc = htmlspecialchars($descRaw, ENT_QUOTES);
-                            $mbr = $selectedUser['memberOf'] ?? [];
-                            if (!is_array($mbr) && $mbr)
-                                $mbr = [$mbr];
-                            $isDisabled = !empty($selectedUser['disabled']);
-                            ?>
-                            <div class="card" style="margin-top:10px" data-focus="user_header">
-                                <h3>Fiche : <?= $prefSam ?></h3>
-                                <div class="small">DN : <code><?= $prefDn ?: '—' ?></code></div>
-                                <div class="small">État :
-                                    <?= $isDisabled ? '<span class="badge" style="background:#7f1d1d;color:#fecaca">Désactivé</span>' : '<span class="badge" style="background:#14532d;color:#bbf7d0">Actif</span>' ?>
-                                </div>
-                            </div>
-
-                            <div class="grid grid-2">
-                                <!-- Modifier l’utilisateur -->
-                                <div class="card" data-focus="user_update">
-                                    <h3>Modifier l’utilisateur</h3>
-                                    <form method="post">
-                                        <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                        <input type="hidden" name="admin_action" value="admin_update_user">
-                                        <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                        <input type="hidden" name="dn" value="<?= $prefDn ?>">
-
-                                        <label class="label">Utilisateur (sAM)</label>
-                                        <input class="input" name="sam_mod" value="<?= $prefSam ?>" required>
-                                        <label class="label">Email</label>
-                                        <input class="input" name="mail_mod" type="email" value="<?= $prefMail ?>">
-                                        <label class="label">Prénom</label>
-                                        <input class="input" name="givenName_mod" value="<?= $prefGiv ?>">
-                                        <label class="label">Nom</label>
-                                        <input class="input" name="sn_mod" value="<?= $prefSn ?>">
-                                        <label class="label">Téléphone</label>
-                                        <input class="input" name="tel_mod" value="<?= $prefTel ?>">
-                                        <label class="label">Adresse</label>
-                                        <input class="input" name="addr_mod" value="<?= $prefAddr ?>">
-                                        <label class="label">Site Web</label>
-                                        <input class="input" name="site_mod" value="<?= $prefSite ?>">
-
-                                        <div class="field">
-                                            <label class="label" for="desc_mod">Description</label>
-                                            <textarea class="input" id="desc_mod" name="desc_mod" rows="3"
-                                                maxlength="1024"><?= $prefDesc ?></textarea>
-                                            <div class="small">1024 caractères max.</div>
-                                        </div>
-
-                                        <label class="label">Expiration du compte</label>
-                                        <div class="row" style="gap:8px">
-                                            <input class="input" type="date" name="exp_date_mod"
-                                                value="<?= htmlspecialchars($exp['date']) ?>">
-                                            <input class="input" type="time" name="exp_time_mod"
-                                                value="<?= htmlspecialchars($exp['time']) ?>">
-                                            <br>
-                                            <label class="label" style="margin:0">Jamais expirer</label>
-                                            <input type="checkbox" name="exp_never_mod" value="1" <?= $exp['isNever'] ? 'checked' : '' ?>>
-                                            <div class="small">Actuel :
-                                                <code><?= htmlspecialchars(user_expiry_label($selectedUser)) ?></code>
-                                            </div>
-                                        </div>
-
-                                        <div style="margin-top:10px"><button class="btn" type="submit">Enregistrer</button>
-                                        </div>
-                                    </form>
-                                </div>
-
-                                <!-- Sécurité & statut -->
-                                <div class="card" data-focus="security">
-                                    <h3>Sécurité & statut</h3>
-                                    <div class="row">
-                                        <form method="post" class="inline">
-                                            <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                            <input type="hidden" name="admin_action" value="enable_user">
-                                            <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                            <input type="hidden" name="sam_toggle" value="<?= $prefSam ?>">
-                                            <button class="btn sm" type="submit">Activer</button>
-                                        </form>
-                                        <form method="post" class="inline">
-                                            <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                            <input type="hidden" name="admin_action" value="disable_user">
-                                            <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                            <input type="hidden" name="sam_toggle" value="<?= $prefSam ?>">
-                                            <button class="btn sm" type="submit">Désactiver</button>
-                                        </form>
-                                        <form method="post" class="inline" title="Efface le verrouillage si présent.">
-                                            <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                            <input type="hidden" name="admin_action" value="unlock_user">
-                                            <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                            <input type="hidden" name="sam_unlock" value="<?= $prefSam ?>">
-                                            <button class="btn sm" type="submit">Déverrouiller</button>
-                                        </form>
-                                    </div>
-                                    <div class="hr"></div>
-                                    <h3>Renommer le CN</h3>
-                                    <form method="post" data-focus="rename_cn">
-                                        <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                        <input type="hidden" name="admin_action" value="rename_user_cn">
-                                        <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                        <input type="hidden" name="sam_for_rename" value="<?= $prefSam ?>">
-                                        <label class="label">Nouveau CN</label>
-                                        <input class="input" name="new_cn" placeholder="Jean Dupont">
-                                        <div style="margin-top:10px"><button class="btn sm" type="submit">Renommer</button></div>
-                                    </form>
-                                    <div class="hr"></div>
-                                    <h3>Déplacer dans une OU</h3>
-                                    <form method="post" data-focus="move_user">
-                                        <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                        <input type="hidden" name="admin_action" value="move_user_ou">
-                                        <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                        <input type="hidden" name="sam_for_move" value="<?= $prefSam ?>">
-                                        <label class="label">OU cible</label>
-                                        <select name="new_ou_dn" class="input" required>
-                                            <option value="">— Choisir une OU —</option>
-                                            <?php foreach ($ouOptions as $opt): ?>
-                                                <option value="<?= htmlspecialchars($opt['dn']) ?>">
-                                                    <?= htmlspecialchars($opt['label']) ?>
-                                                </option>
-                                            <?php endforeach; ?>
-                                        </select>
-                                        <div style="margin-top:10px"><button class="btn sm" type="submit">Déplacer</button></div>
-                                    </form>
-                                </div>
-
-                                <!-- Reset password -->
-                                <div class="card" data-focus="password_reset">
-                                    <h3>Réinitialiser le mot de passe</h3>
-                                    <form method="post">
-                                        <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                        <input type="hidden" name="admin_action" value="admin_reset_pw">
-                                        <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                        <label class="label">Utilisateur (sAM)</label>
-                                        <input class="input" name="sam_reset" value="<?= $prefSam ?>" required>
-                                        <label class="label">Nouveau mot de passe</label>
-                                        <input class="input" name="new_password" type="password" required>
-                                        <div class="row">
-                                            <label class="label" style="margin:0">Exiger le changement au prochain logon</label>
-                                            <input type="checkbox" name="must_change" value="1">
-                                        </div>
-                                        <div style="margin-top:10px"><button class="btn" type="submit">Réinitialiser</button></div>
-                                    </form>
-                                    <div class="hr"></div>
-                                    <h3>Supprimer l’utilisateur</h3>
-                                    <form method="post" onsubmit="return confirm('Confirmer la suppression de <?= $prefSam ?> ?')">
-                                        <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                        <input type="hidden" name="admin_action" value="delete_user">
-                                        <label class="label">Identifiant utilisé</label>
-                                        <input class="input" name="del_id" value="<?= $prefDn ?: $prefSam ?>" required>
-                                        <div style="margin-top:10px"><button class="btn" type="submit">Supprimer</button></div>
-                                    </form>
-                                </div>
-
-                                <!-- Groupes de l'utilisateur -->
-                                <div class="card" data-focus="groups_user" style="grid-column:1/-1">
-                                    <h3>Groupes</h3>
-                                    <?php if (!empty($mbr)): ?>
-                                        <div class="small">Groupes actuels :</div>
-                                        <ul class="small">
-                                            <?php foreach ($mbr as $gdn):
-                                                $gdnEsc = htmlspecialchars($gdn, ENT_QUOTES); ?>
-                                                <li style="margin:6px 0">
-                                                    <form method="post" style="display:inline">
-                                                        <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                                        <input type="hidden" name="admin_action" value="remove_from_group">
-                                                        <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                                        <input type="hidden" name="user_for_group" value="<?= $prefSam ?>">
-                                                        <input type="hidden" name="group_dn_remove" value="<?= $gdnEsc ?>">
-                                                        <button class="btn sm" type="submit">Retirer</button>
-                                                    </form>
-                                                    <code style="margin-left:8px"><?= $gdnEsc ?></code>
-                                                </li>
-                                            <?php endforeach; ?>
-                                        </ul>
-                                    <?php else: ?>
-                                        <div class="small">Aucun groupe trouvé.</div>
-                                    <?php endif; ?>
-
-                                    <div class="hr"></div>
-                                    <h4>Ajouter à un groupe</h4>
-                                    <form method="post" class="row" style="gap:8px" data-focus="groups_user_search">
-                                        <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                        <input type="hidden" name="admin_action" value="search_groups_user">
-                                        <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                        <input type="hidden" name="gpU"
-                                            value="<?= htmlspecialchars((string) ($_GET['gpU'] ?? 1)) ?>">
-                                        <input type="hidden" name="gpsU"
-                                            value="<?= htmlspecialchars((string) ($_GET['gpsU'] ?? 50)) ?>">
-                                        <input class="input" name="group_query" placeholder="Rechercher un groupe (utilisez *)"
-                                            value="<?= htmlspecialchars($groupQueryUser ?? ($_GET['gqU'] ?? '')) ?>">
-                                        <button class="btn sm" type="submit">Rechercher</button>
-                                    </form>
-
-                                    <?php if (!empty($_GET['gqU']) || !empty($groupQueryUser)): ?>
-                                        <form method="post" style="margin-top:10px">
-                                            <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                            <input type="hidden" name="admin_action" value="add_to_group">
-                                            <input type="hidden" name="persist_selected_sam" value="<?= $prefSam ?>">
-                                            <input type="hidden" name="user_for_group" value="<?= $prefSam ?>">
-                                            <label class="label">Résultats</label>
-                                            <select class="input" name="group_dn_add" required>
-                                                <option value="">— Sélectionner —</option>
-                                                <?php foreach ($groupResultsUser as $g):
-                                                    $dn = htmlspecialchars($g['dn'] ?? '');
-                                                    $nm = htmlspecialchars($g['name'] ?? ($g['sam'] ?? ''));
-                                                    $samg = htmlspecialchars($g['sam'] ?? '');
-                                                    $lbl = trim($nm . ($samg ? " ($samg)" : ''));
-                                                    ?>
-                                                    <option value="<?= $dn ?>"><?= $lbl ?> — <?= $dn ?></option>
-                                                <?php endforeach; ?>
-                                            </select>
-                                            <div style="margin-top:10px"><button class="btn" type="submit">Ajouter</button></div>
-                                        </form>
-                                    <?php endif; ?>
-                                </div>
-                            </div>
-                        </div>
-                    <?php endif; ?>
+                        <?php /* Bloc legacy supprimé: gestion détaillée utilisateur par formulaires inline. */ ?>
 
                     <!-- Liste des utilisateurs (VIDE par défaut si pas de recherche) -->
                     <div class="card" style="margin-top:16px" data-focus="users_list">
@@ -3704,7 +4541,7 @@ if ($uiError) {
                                     $state = $disabled
                                         ? '<span class="badge" style="background:#7f1d1d;color:#fecaca">Désactivé</span>'
                                         : '<span class="badge" style="background:#14532d;color:#bbf7d0">Actif</span>';
-                                    $link = '?select_sam=' . urlencode($sam) . '#tab-admin-users';
+                                    $link = '?exq=' . urlencode($sam) . '&extype=user#tab-explorer';
                                     ?>
                                     <tr>
                                         <!-- NB: associe explicitement la case au formulaire bulk -->
@@ -3717,7 +4554,7 @@ if ($uiError) {
                                         <td><?= $isAdm ? '<span class="badge">Oui</span>' : '<span class="badge">Non</span>' ?></td>
                                         <td><?= $state ?></td>
                                         <td class="actions">
-                                            <a class="btn sm" href="<?= $link ?>">Détails</a>
+                                            <a class="btn sm" href="<?= $link ?>">Explorer AD</a>
 
                                             <?php if ($disabled): ?>
                                                 <form method="post" class="inline">
@@ -3764,65 +4601,7 @@ if ($uiError) {
                         <?php endif; ?>
                     </div>
 
-                    <!-- Formulaires UTILISATEURS (création) -->
-                    <div class="grid grid-2" style="margin-top:16px">
-                        <!-- Créer un utilisateur -->
-                        <div class="card" data-focus="create_user">
-                            <h3>Créer un utilisateur</h3>
-                            <form method="post">
-                                <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
-                                <input type="hidden" name="admin_action" value="create_user">
-                                <label class="label">OU</label>
-                                <?php $currentOu = $_POST['ouDn'] ?? ''; ?>
-                                <?php if (!empty($ouOptions)): ?>
-                                    <select class="input" name="ouDn" required>
-                                        <option value="">— Choisir une OU —</option>
-                                        <?php foreach ($ouOptions as $opt):
-                                            $dn = (string) $opt['dn'];
-                                            $sel = ($currentOu !== '' && strcasecmp(trim($currentOu), trim($dn)) === 0) ? ' selected' : '';
-                                            ?>
-                                            <option value="<?= htmlspecialchars($dn) ?>" <?= $sel ?>>
-                                                <?= htmlspecialchars($opt['label']) ?>
-                                            </option>
-                                        <?php endforeach; ?>
-                                    </select>
-                                <?php else: ?>
-                                    <div class="small" style="color:#fca5a5">Aucune OU/container détecté depuis l’arborescence.
-                                        Saisissez l’OU manuellement :</div>
-                                    <input class="input" name="ouDn" placeholder="OU=...,DC=...,DC=..." required>
-                                <?php endif; ?>
-
-                                <label class="label">CN</label><input class="input" name="cn" required>
-                                <label class="label">sAMAccountName</label><input class="input" name="sam" required>
-                                <label class="label">Prénom</label><input class="input" name="givenName" required>
-                                <label class="label">Nom</label><input class="input" name="sn" required>
-                                <label class="label">UPN</label><input class="input" name="userPrincipalName"
-                                    placeholder="user@domaine.local" required>
-                                <label class="label">Email</label><input class="input" name="mail" type="email">
-                                <label class="label">Mot de passe initial</label><input class="input" name="password"
-                                    type="password" required>
-                                <label class="label">Description (optionnel)</label>
-                                <textarea class="input" name="description"
-                                    placeholder="Description libre (limite 1024 caractères)" maxlength="1024"></textarea>
-
-                                <label class="label">Expiration du compte</label>
-                                <div class="row" style="gap:8px">
-                                    <input class="input" type="date" name="exp_date" style="max-width:220px">
-                                    <input class="input" type="time" name="exp_time" style="max-width:160px">
-                                    <label class="label" style="margin:0 6px 0 10px">Jamais</label>
-                                    <input type="checkbox" name="exp_never" value="1" checked>
-                                </div>
-                                <div class="row">
-                                    <label class="label" style="margin:0">Forcer le changement de mot de passe à la première
-                                        connexion</label>
-                                    <input type="checkbox" name="must_change_at_first_login" value="1">
-                                </div>
-                                <div class="row"><label class="label" style="margin:0">Activer le compte</label><input
-                                        type="checkbox" name="enabled" value="1"></div>
-                                <div style="margin-top:10px"><button class="btn" type="submit">Créer</button></div>
-                            </form>
-                        </div>
-                    </div>
+                    <!-- Formulaires UTILISATEURS legacy supprimés (doublon avec modales Explorateur AD). -->
 
                 <?php endif; ?>
             </div>
@@ -3832,8 +4611,49 @@ if ($uiError) {
                 <?php if ($canDomainAdmin): ?>
                     <h2>Explorateur Active Directory</h2>
                     <p class="page-subtitle" style="margin-bottom:16px">
-                        Parcourez l’arborescence du domaine (OU, groupes, utilisateurs, ordinateurs) pour visualiser rapidement la structure AD.
+                        Exploration complète du périmètre AD autorisé (BaseDn): OU, conteneurs, groupes, utilisateurs, inetOrgPerson, ordinateurs.
                     </p>
+                    <div class="small" style="margin-bottom:12px">
+                        BaseDn actif :
+                        <code><?= htmlspecialchars((string) ($adMeta['baseDn'] ?? ($adTree['explorerBaseDn'] ?? $adTree['baseDn'] ?? 'inconnu'))) ?></code>
+                    </div>
+                    <form method="get" class="row" style="gap:8px; margin-bottom:12px; align-items:end">
+                        <div style="min-width:300px;flex:1">
+                            <label class="label">Recherche objet AD (nom, DN, classe)</label>
+                            <input class="input" name="exq" value="<?= htmlspecialchars($explorerQuery) ?>" placeholder="ex: DUPONT, PC-01, OU=Support, group">
+                        </div>
+                        <div>
+                            <label class="label">Type recherché</label>
+                            <select class="input" name="extype">
+                                <option value="all" <?= $explorerTypeFilter === 'all' ? 'selected' : '' ?>>Tous</option>
+                                <option value="user" <?= $explorerTypeFilter === 'user' ? 'selected' : '' ?>>Utilisateur</option>
+                                <option value="inetorgperson" <?= $explorerTypeFilter === 'inetorgperson' ? 'selected' : '' ?>>Personne</option>
+                                <option value="computer" <?= $explorerTypeFilter === 'computer' ? 'selected' : '' ?>>Ordinateur</option>
+                                <option value="group" <?= $explorerTypeFilter === 'group' ? 'selected' : '' ?>>Groupe</option>
+                                <option value="ou" <?= $explorerTypeFilter === 'ou' ? 'selected' : '' ?>>OU</option>
+                                <option value="container" <?= $explorerTypeFilter === 'container' ? 'selected' : '' ?>>Conteneur</option>
+                                <option value="domain" <?= $explorerTypeFilter === 'domain' ? 'selected' : '' ?>>Domaine</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="label">Trier par</label>
+                            <select class="input" name="tree_sort">
+                                <option value="name" <?= $explorerTreeSortBy === 'name' ? 'selected' : '' ?>>Nom</option>
+                                <option value="type" <?= $explorerTreeSortBy === 'type' ? 'selected' : '' ?>>Type</option>
+                                <option value="dn" <?= $explorerTreeSortBy === 'dn' ? 'selected' : '' ?>>DN</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="label">Ordre</label>
+                            <select class="input" name="tree_dir">
+                                <option value="asc" <?= $explorerTreeSortDir === 'asc' ? 'selected' : '' ?>>Croissant</option>
+                                <option value="desc" <?= $explorerTreeSortDir === 'desc' ? 'selected' : '' ?>>Décroissant</option>
+                            </select>
+                        </div>
+                        <div>
+                            <button class="btn" type="submit" onclick="history.replaceState(null,'','#tab-explorer')">Rechercher / Trier</button>
+                        </div>
+                    </form>
                     <div class="ad-explorer">
                         <div class="card ad-tree-card">
                             <h3 style="margin-top:0">Arborescence</h3>
@@ -3844,9 +4664,27 @@ if ($uiError) {
                                     $nodes = $adTree['nodes'] ?? [];
                                 }
                                 if ($nodes) {
-                                    render_ad_tree_nodes($nodes);
+                                    $baseDnNode = (string) ($adMeta['baseDn'] ?? ($adTree['explorerBaseDn'] ?? $adTree['baseDn'] ?? ''));
+                                    if ($baseDnNode !== '') {
+                                        $root = [[
+                                            'name' => 'Racine',
+                                            'dn' => $baseDnNode,
+                                            'type' => 'domain',
+                                            'hasChildren' => true,
+                                            'children' => $nodes,
+                                            'description' => 'BaseDn actif',
+                                            'objectClasses' => ['domainDNS'],
+                                        ]];
+                                        render_ad_tree_nodes($root);
+                                    } else {
+                                        render_ad_tree_nodes($nodes);
+                                    }
                                 } else {
-                                    echo '<div class="small">Arborescence indisponible (échec de /tree). Vérifiez la connectivité API/LDAP.</div>';
+                                    if ($explorerQuery !== '' || $explorerTypeFilter !== 'all') {
+                                        echo '<div class="small">Aucun objet ne correspond aux filtres courants. Ajustez la recherche ou le type.</div>';
+                                    } else {
+                                        echo '<div class="small">Arborescence indisponible (échec de /tree). Vérifiez la connectivité API/LDAP.</div>';
+                                    }
                                 }
                                 ?>
                             </div>
@@ -3856,6 +4694,9 @@ if ($uiError) {
                             <div id="ad-details" class="small">
                                 Sélectionnez un objet dans l’arborescence pour afficher ses informations (DN, type, chemins).
                             </div>
+                            <div id="ad-actions" class="ad-actions">
+                                <div class="small">Sélectionnez un objet pour afficher les actions disponibles.</div>
+                            </div>
                         </div>
                     </div>
                 <?php else: ?>
@@ -3863,6 +4704,15 @@ if ($uiError) {
                         <div class="small">Accès réservé aux administrateurs du domaine.</div>
                     </div>
                 <?php endif; ?>
+            </div>
+            <div id="explorer-modal" class="modal-backdrop" onclick="if(event.target===this) closeExplorerModal()">
+                <div class="modal-card">
+                    <div class="modal-head">
+                        <h3 id="explorer-modal-title">Action</h3>
+                        <button type="button" class="btn sm" onclick="closeExplorerModal()">Fermer</button>
+                    </div>
+                    <div id="explorer-modal-body"></div>
+                </div>
             </div>
 
             <!-- ADMIN — DOMAINE -->

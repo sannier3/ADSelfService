@@ -7,6 +7,7 @@ using System.DirectoryServices.Protocols;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using YamlDotNet.Serialization;
@@ -70,6 +71,7 @@ public class Program
     {
         public List<string> AllowedIps { get; set; } = new() { "127.0.0.1", "::1" };
         public string? InternalSharedSecret { get; set; } = null;
+        public bool RequireAppContextHeader { get; set; } = true;
     }
 
     public class PaginationConfig
@@ -126,7 +128,8 @@ public class Program
         bool NeverExpires = false
     );
 
-    public record GroupChangeRequest(string User, string GroupDn);
+    public record SetUserGroupsRequest(string User, List<string> Groups);
+    public record SetGroupMembersRequest(string Group, List<string> Members);
 
     public record AdminUpdateUserRequest(string User, Dictionary<string, string?> Attributes);
 
@@ -302,6 +305,12 @@ public class Program
         if (string.IsNullOrWhiteSpace(c.Ldap.GroupBaseDn)) errors.Add("ldap.groupBaseDn manquant.");
         if (string.IsNullOrWhiteSpace(c.Ldap.AdminGroupDn)) errors.Add("ldap.adminGroupDn manquant.");
         if (c.Pagination.PageSize <= 0) errors.Add("pagination.pageSize doit être > 0.");
+        if (!c.Ldap.Ssl && !c.Ldap.UseKerberosSealing)
+            errors.Add("Activez ldap.ssl=true ou ldap.useKerberosSealing=true pour éviter un transport LDAP non protégé.");
+        if (!string.IsNullOrWhiteSpace(c.Security.InternalSharedSecret) && c.Security.InternalSharedSecret.Trim().Length < 32)
+            errors.Add("security.internalSharedSecret doit faire au moins 32 caractères.");
+        if (c.Debug.ShowPasswords)
+            errors.Add("debug.showPasswords=true est interdit pour des raisons de sécurité.");
 
         foreach (var ip in c.Security.AllowedIps)
         {
@@ -324,11 +333,25 @@ public class Program
     static bool IsLikelyDefault(AppConfig c)
     {
         bool placeholderPwd = string.Equals(c.Ldap.BindPassword, "ChangeMe!", StringComparison.Ordinal);
+        bool placeholderSecret = string.IsNullOrWhiteSpace(c.Security.InternalSharedSecret) ||
+            c.Security.InternalSharedSecret.Contains("example", StringComparison.OrdinalIgnoreCase);
         bool exampleDn =
             (c.Ldap.RootDn?.Contains("example", StringComparison.OrdinalIgnoreCase) ?? false) ||
             (c.Ldap.BindDn?.Contains("example", StringComparison.OrdinalIgnoreCase) ?? false) ||
             (c.Ldap.BaseDn?.Contains("example", StringComparison.OrdinalIgnoreCase) ?? false);
-        return placeholderPwd || exampleDn;
+        return placeholderPwd || exampleDn || placeholderSecret;
+    }
+    static List<string> SecurityWarnings(AppConfig c)
+    {
+        var warnings = new List<string>();
+        if (c.Ldap.Ssl && c.Ldap.IgnoreCertificate)
+            warnings.Add("ldap.ignoreCertificate=true: vérification TLS désactivée.");
+        if (c.Debug.Enabled && c.Server.Urls.Any(u =>
+            !u.Contains("127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            && !u.Contains("localhost", StringComparison.OrdinalIgnoreCase)
+            && !u.Contains("[::1]", StringComparison.OrdinalIgnoreCase)))
+            warnings.Add("debug.enabled=true avec écoute non locale: désactivez debug en production.");
+        return warnings;
     }
     static bool DnIsStrictlyUnder(string child, string parent)
     => !child.Equals(parent, StringComparison.OrdinalIgnoreCase)
@@ -678,6 +701,69 @@ public class Program
         uint mask = cidr == 0 ? 0 : uint.MaxValue << (32 - cidr);
         return (addr & mask) == (sub & mask);
     }
+    static string GetRequestAppContext(HttpContext context)
+        => (context.Request.Headers["X-App-Context"].FirstOrDefault() ?? "").Trim().ToLowerInvariant();
+
+    static bool IsRequestContextAllowed(HttpContext context, SecurityConfig security)
+    {
+        if (!security.RequireAppContextHeader) return true;
+
+        var path = (context.Request.Path.Value ?? "").ToLowerInvariant();
+        if (path == "/health") return true;
+
+        var appCtx = GetRequestAppContext(context);
+        if (string.IsNullOrWhiteSpace(appCtx)) return false;
+
+        if (path == "/auth") return appCtx == "intranet-login";
+        if (path == "/recovery/lookup") return appCtx == "forgot-reset";
+
+        if (path.StartsWith("/explorer/") || path == "/tree" || path == "/meta/ad" || path == "/groups" ||
+            path.StartsWith("/admin/ou/") || path == "/admin/creategroup" || path == "/admin/deletegroup")
+            return appCtx == "admin-domain";
+
+        if (path.StartsWith("/admin/"))
+        {
+            if (path == "/admin/changepassword")
+                return appCtx is "admin-user" or "admin-domain" or "forgot-reset";
+            return appCtx is "admin-user" or "admin-domain";
+        }
+
+        if (path.StartsWith("/user/") || path.StartsWith("/users"))
+            return appCtx is "self-service" or "admin-user" or "admin-domain";
+
+        // Par défaut on refuse explicitement les appels sans contexte connu.
+        return false;
+    }
+
+    static string? NormalizeFrenchPhone(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var compact = Regex.Replace(raw, @"[^\d\+]", "");
+        if (string.IsNullOrWhiteSpace(compact)) return null;
+
+        if (compact.StartsWith("+"))
+        {
+            return Regex.IsMatch(compact, @"^\+33[1-9]\d{8}$") ? compact : null;
+        }
+
+        var digits = Regex.Replace(compact, @"\D+", "");
+        if (digits.Length == 10 && digits[0] == '0')
+        {
+            var e164 = "+33" + digits[1..];
+            return Regex.IsMatch(e164, @"^\+33[1-9]\d{8}$") ? e164 : null;
+        }
+        if (digits.Length == 11 && digits.StartsWith("33"))
+        {
+            var e164 = "+" + digits;
+            return Regex.IsMatch(e164, @"^\+33[1-9]\d{8}$") ? e164 : null;
+        }
+        if (digits.Length == 12 && digits.StartsWith("0033"))
+        {
+            var e164 = "+" + digits[2..];
+            return Regex.IsMatch(e164, @"^\+33[1-9]\d{8}$") ? e164 : null;
+        }
+        return null;
+    }
     static List<string> GetMemberOfDns(DirectoryAttribute? memberOfAttr)
     {
         var res = new List<string>();
@@ -755,7 +841,9 @@ public class Program
         string type,
         bool hasChildren,
         List<LdapTreeNode>? children,
-        string? description = null
+        string? description = null,
+        string[]? objectClasses = null,
+        string? samAccountName = null
     );
     static string? DnToCn(string? dn)
     {
@@ -786,8 +874,22 @@ public class Program
         if (set.Contains("container") || set.Contains("builtinDomain")) return "container";
         if (set.Contains("group")) return "group";
         if (set.Contains("computer")) return "computer";
+        if (set.Contains("inetOrgPerson")) return "inetOrgPerson";
         if (set.Contains("user")) return "user";
         return "other";
+    }
+
+    static string[] GetObjectClassesFromEntry(SearchResultEntry e)
+    {
+        var oc = e.Attributes["objectClass"];
+        if (oc is null || oc.Count == 0) return Array.Empty<string>();
+        var list = new List<string>(oc.Count);
+        for (int i = 0; i < oc.Count; i++)
+        {
+            var v = oc[i]?.ToString();
+            if (!string.IsNullOrWhiteSpace(v)) list.Add(v);
+        }
+        return list.ToArray();
     }
 
     static bool NodeHasChildContainers(LdapConnection conn, string dn)
@@ -795,6 +897,18 @@ public class Program
         var check = new SearchRequest(
             dn,
             "(|(objectClass=organizationalUnit)(objectClass=container))",
+            SearchScope.OneLevel,
+            new[] { "distinguishedName" });
+        check.SizeLimit = 1;
+        var r = (SearchResponse)conn.SendRequest(check);
+        return r.Entries.Count > 0;
+    }
+
+    static bool NodeHasAnyChildren(LdapConnection conn, string dn)
+    {
+        var check = new SearchRequest(
+            dn,
+            "(objectClass=*)",
             SearchScope.OneLevel,
             new[] { "distinguishedName" });
         check.SizeLimit = 1;
@@ -812,10 +926,10 @@ public class Program
         var nodes = new List<LdapTreeNode>();
 
         string filter = includeLeaves
-            ? "(|(objectClass=organizationalUnit)(objectClass=container)(objectClass=group)(objectClass=user)(objectClass=computer))"
+            ? "(|(objectClass=organizationalUnit)(objectClass=container)(objectClass=group)(objectClass=user)(objectClass=computer)(objectClass=inetOrgPerson))"
             : "(|(objectClass=organizationalUnit)(objectClass=container))";
 
-        var attrs = new[] { "ou", "cn", "name", "distinguishedName", "objectClass", "description" };
+        var attrs = new[] { "ou", "cn", "name", "distinguishedName", "objectClass", "description", "sAMAccountName" };
 
         var req = new SearchRequest(dn, filter, SearchScope.OneLevel, attrs);
         req.Controls.Add(new PageResultRequestControl(maxChildren));
@@ -829,17 +943,23 @@ public class Program
             var name = GetNameFromEntry(e);
             var type = GetNodeTypeFromEntry(e);
             var desc = e.Attributes["description"]?[0]?.ToString();
+            var objectClasses = GetObjectClassesFromEntry(e);
+            var sam = e.Attributes["sAMAccountName"]?[0]?.ToString();
 
             if (depth > 1)
             {
                 var children = BuildLevel(conn, e.DistinguishedName, depth - 1, includeLeaves, maxChildren);
-                var hasChildren = children.Count > 0 || NodeHasChildContainers(conn, e.DistinguishedName);
-                nodes.Add(new LdapTreeNode(name, e.DistinguishedName, type, hasChildren, children, desc));
+                var hasChildren = includeLeaves
+                    ? (children.Count > 0 || NodeHasAnyChildren(conn, e.DistinguishedName))
+                    : (children.Count > 0 || NodeHasChildContainers(conn, e.DistinguishedName));
+                nodes.Add(new LdapTreeNode(name, e.DistinguishedName, type, hasChildren, children, desc, objectClasses, sam));
             }
             else
             {
-                var hasChildren = NodeHasChildContainers(conn, e.DistinguishedName);
-                nodes.Add(new LdapTreeNode(name, e.DistinguishedName, type, hasChildren, null, desc));
+                var hasChildren = includeLeaves
+                    ? NodeHasAnyChildren(conn, e.DistinguishedName)
+                    : NodeHasChildContainers(conn, e.DistinguishedName);
+                nodes.Add(new LdapTreeNode(name, e.DistinguishedName, type, hasChildren, null, desc, objectClasses, sam));
             }
         }
 
@@ -856,6 +976,9 @@ public class Program
     }
 
     // Base de recherche des groupes
+    static string EffectiveExplorerBaseDn(AppConfig cfg)
+        => string.IsNullOrWhiteSpace(cfg.Ldap.BaseDn) ? cfg.Ldap.RootDn : cfg.Ldap.BaseDn;
+
     static string EffectiveGroupBaseDn(AppConfig cfg) =>
         string.IsNullOrWhiteSpace(cfg.Ldap.GroupBaseDn) ? cfg.Ldap.RootDn : cfg.Ldap.GroupBaseDn;
 
@@ -873,13 +996,62 @@ public class Program
         return resp.Entries.Count > 0 ? resp.Entries[0].DistinguishedName : null;
     }
 
-    // Vérifie l’appartenance (pour idempotence)
-    static bool IsUserMemberOfGroup(LdapConnection conn, string groupDn, string userDn)
+    static string? ResolveUserDn(AppConfig cfg, LdapConnection connection, string input)
     {
-        var safeUser = EscapeLdapFilterValue(userDn);
-        var req = new SearchRequest(groupDn, $"(member={safeUser})", SearchScope.Base, "distinguishedName");
-        var resp = (SearchResponse)conn.SendRequest(req);
-        return resp.Entries.Count > 0;
+        if (LooksLikeDn(input)) return input;
+        var safe = EscapeLdapFilterValue(input);
+        var req = new SearchRequest(
+            EffectiveExplorerBaseDn(cfg),
+            $"(&(&(objectCategory=person)(|(objectClass=user)(objectClass=inetOrgPerson)))(sAMAccountName={safe}))",
+            SearchScope.Subtree,
+            new[] { "distinguishedName" }
+        );
+        req.SizeLimit = 1;
+        var resp = (SearchResponse)connection.SendRequest(req);
+        return resp.Entries.Count > 0 ? resp.Entries[0].DistinguishedName : null;
+    }
+
+    static List<string> GetDirectUserGroupDns(LdapConnection connection, string userDn)
+    {
+        if (!TryGetEntry(connection, userDn, out var userEntry, new[] { "memberOf" }) || userEntry is null)
+            return new List<string>();
+        return userEntry.Attributes["memberOf"]?.GetValues(typeof(string)).Cast<string>().Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+               ?? new List<string>();
+    }
+
+    static List<string> GetDirectGroupMemberDns(LdapConnection connection, string groupDn)
+    {
+        if (!TryGetEntry(connection, groupDn, out var groupEntry, new[] { "member" }) || groupEntry is null)
+            return new List<string>();
+        return groupEntry.Attributes["member"]?.GetValues(typeof(string)).Cast<string>().Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+               ?? new List<string>();
+    }
+
+    static object GroupDtoFromDn(LdapConnection connection, string dn)
+    {
+        if (!TryGetEntry(connection, dn, out var g, new[] { "objectGUID", "cn", "name", "sAMAccountName", "distinguishedName", "description", "objectClass" }) || g is null)
+        {
+            return new
+            {
+                id = (Guid?)null,
+                name = DnToCn(dn) ?? dn,
+                sam = (string?)null,
+                dn,
+                description = (string?)null,
+                type = "group"
+            };
+        }
+        byte[]? guidBin = g.Attributes["objectGUID"]?[0] as byte[];
+        Guid? guid = guidBin != null ? new Guid(guidBin) : (Guid?)null;
+        return new
+        {
+            id = guid,
+            name = g.Attributes["cn"]?[0]?.ToString() ?? g.Attributes["name"]?[0]?.ToString() ?? DnToCn(dn) ?? dn,
+            sam = g.Attributes["sAMAccountName"]?[0]?.ToString(),
+            dn = g.Attributes["distinguishedName"]?[0]?.ToString() ?? dn,
+            description = g.Attributes["description"]?[0]?.ToString(),
+            type = GetNodeTypeFromEntry(g)
+        };
     }
 
     // Récupère tous les groupes (DN) en suivant l’imbrication grâce au matching rule IN_CHAIN
@@ -982,6 +1154,51 @@ public class Program
 
     static string ToAccountExpiresFileTime(DateTimeOffset dto)
         => dto.UtcDateTime.ToFileTimeUtc().ToString();
+
+    static DateTimeOffset? ParseAdFileTimeUtc(string? v)
+    {
+        if (string.IsNullOrWhiteSpace(v)) return null;
+        if (!long.TryParse(v, out var ft)) return null;
+        if (ft <= 0 || ft == long.MaxValue) return null;
+        try
+        {
+            return new DateTimeOffset(DateTime.FromFileTimeUtc(ft), TimeSpan.Zero);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    static DateTimeOffset? ParseAdGeneralizedTimeUtc(string? v)
+    {
+        if (string.IsNullOrWhiteSpace(v)) return null;
+        if (DateTimeOffset.TryParse(v, out var dto))
+            return dto.ToUniversalTime();
+        if (DateTime.TryParseExact(v, "yyyyMMddHHmmss.0Z", null, System.Globalization.DateTimeStyles.AssumeUniversal, out var dt1))
+            return new DateTimeOffset(dt1.ToUniversalTime());
+        if (DateTime.TryParseExact(v, "yyyyMMddHHmmssZ", null, System.Globalization.DateTimeStyles.AssumeUniversal, out var dt2))
+            return new DateTimeOffset(dt2.ToUniversalTime());
+        return null;
+    }
+
+    static async Task<string[]> ResolveHostIpsAsync(string? hostName)
+    {
+        if (string.IsNullOrWhiteSpace(hostName)) return Array.Empty<string>();
+        try
+        {
+            var addresses = await Dns.GetHostAddressesAsync(hostName.Trim());
+            return addresses
+                .Select(a => a.ToString())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(8)
+                .ToArray();
+        }
+        catch
+        {
+            return Array.Empty<string>();
+        }
+    }
 
     static DirectoryAttributeModification BuildReplaceAccountExpires(bool never, DateTimeOffset? when)
     {
@@ -1121,6 +1338,31 @@ public class Program
     }
 
     static string NewOuDn(string parentDn, string name) => $"OU={EscapeRdnValue(name)},{parentDn}";
+
+    static Dictionary<string, object?> BuildExplorerCapabilities(string type, bool underBaseDn)
+    {
+        var isContainer = type is "ou" or "container" or "domain";
+        var isUser = type is "user" or "inetOrgPerson";
+        var isGroup = type is "group";
+        var isOu = type is "ou";
+
+        return new Dictionary<string, object?>
+        {
+            ["canCreateOu"] = underBaseDn && isContainer,
+            ["canUpdateOu"] = underBaseDn && isOu,
+            ["canDeleteOu"] = underBaseDn && isOu,
+            ["canCreateUser"] = underBaseDn && isContainer,
+            ["canDeleteUser"] = underBaseDn && isUser,
+            ["canMoveUser"] = underBaseDn && isUser,
+            ["canSetUserEnabled"] = underBaseDn && isUser,
+            ["canUnlockUser"] = underBaseDn && isUser,
+            ["canRenameUserCn"] = underBaseDn && isUser,
+            ["canResetUserPassword"] = underBaseDn && isUser,
+            ["canCreateGroup"] = underBaseDn && isContainer,
+            ["canDeleteGroup"] = underBaseDn && isGroup,
+            ["canManageGroupMembers"] = underBaseDn && (isUser || isGroup)
+        };
+    }
     
     // Convertit des octets en séquence \XX pour un filtre LDAP (RFC4515)
     static string BytesToLdapHex(byte[] bytes)
@@ -1217,6 +1459,8 @@ public class Program
             Log.CloseAndFlush();
             Environment.Exit(1);
         }
+        foreach (var w in SecurityWarnings(cfg))
+            Log.Warning("[SECURITY] {Warning}", w);
 
         // 5) Startup check LDAP
         if (cfg.StartupCheck.Enabled)
@@ -1291,6 +1535,14 @@ public class Program
             {
                 context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
                 await context.Response.WriteAsync("Accès interdit.");
+                return;
+            }
+
+            // 3) Contrôle de contexte applicatif (défense en profondeur, côté API)
+            if (!IsRequestContextAllowed(context, cfg.Security))
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+                await context.Response.WriteAsJsonAsync(new { error = "Accès interdit (contexte applicatif)." });
                 return;
             }
             await next();
@@ -2241,180 +2493,6 @@ public class Program
             }
         });
 
-        // POST /admin/addToGroup
-        app.MapPost("/admin/addToGroup", async (HttpContext http) =>
-        {
-            try
-            {
-                var req = await http.Request.ReadFromJsonAsync<GroupChangeRequest>();
-                if (req == null || string.IsNullOrWhiteSpace(req.User) || string.IsNullOrWhiteSpace(req.GroupDn))
-                {
-                    http.Response.StatusCode = 400;
-                    await http.Response.WriteAsJsonAsync(new { error = "user et groupDn requis." });
-                    return;
-                }
-
-                using var connection = GetLdapConnection(cfg);
-                if (!BindServiceAccount(connection, cfg))
-                {
-                    http.Response.StatusCode = 500;
-                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
-                    return;
-                }
-
-                // 1) Résoudre l'utilisateur -> DN (accepte DN ou sAM)
-                string userDn = req.User.Contains("DC=", StringComparison.OrdinalIgnoreCase)
-                    ? req.User
-                    : (SearchUserBySam(cfg, req.User) as dynamic)?.dn;
-
-                if (string.IsNullOrWhiteSpace(userDn))
-                {
-                    http.Response.StatusCode = 404;
-                    await http.Response.WriteAsJsonAsync(new { error = "Utilisateur introuvable." });
-                    return;
-                }
-
-                // 2) Résoudre le groupe (accepte DN, CN, sAM, name)
-                var groupDn = ResolveGroupDn(cfg, connection, req.GroupDn);
-                if (string.IsNullOrWhiteSpace(groupDn))
-                {
-                    http.Response.StatusCode = 404;
-                    await http.Response.WriteAsJsonAsync(new { error = "Groupe introuvable." });
-                    return;
-                }
-
-                // 3) Idempotence : si déjà membre, on considère OK
-                if (IsUserMemberOfGroup(connection, groupDn, userDn))
-                {
-                    await http.Response.WriteAsJsonAsync(new { success = true, note = "Déjà membre du groupe." });
-                    return;
-                }
-
-                // 4) Ajout du membre
-                var mod = new DirectoryAttributeModification
-                {
-                    Operation = DirectoryAttributeOperation.Add,
-                    Name = "member"
-                };
-                mod.Add(userDn);
-
-                var mreq = new ModifyRequest(groupDn, mod);
-                _ = (ModifyResponse)connection.SendRequest(mreq);
-
-                await http.Response.WriteAsJsonAsync(new { success = true });
-            }
-            catch (DirectoryOperationException doe)
-            {
-                // En cas de course (ajout en parallèle) : "attribute or value exists" => on considère OK
-                var msg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
-                if (msg.IndexOf("attributeOrValueExists", StringComparison.OrdinalIgnoreCase) >= 0
-                    || msg.IndexOf("attribute or value exists", StringComparison.OrdinalIgnoreCase) >= 0
-                    || (doe.Response?.ResultCode == ResultCode.AttributeOrValueExists))
-                {
-                    await http.Response.WriteAsJsonAsync(new { success = true, note = "Déjà membre (ou ajouté en parallèle)." });
-                    return;
-                }
-
-                Log.Error(doe, "[POST /admin/addToGroup] DirectoryOperationException");
-                http.Response.StatusCode = 400;
-                await http.Response.WriteAsJsonAsync(new { error = doe.Message, serverError = doe.Response?.ErrorMessage });
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, "[POST /admin/addToGroup] Exception");
-                http.Response.StatusCode = 500;
-                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
-            }
-        });
-
-        // POST /admin/removeFromGroup
-        app.MapPost("/admin/removeFromGroup", async (HttpContext http) =>
-        {
-            try
-            {
-                var req = await http.Request.ReadFromJsonAsync<GroupChangeRequest>();
-                if (req == null || string.IsNullOrWhiteSpace(req.User) || string.IsNullOrWhiteSpace(req.GroupDn))
-                {
-                    http.Response.StatusCode = 400;
-                    await http.Response.WriteAsJsonAsync(new { error = "user et groupDn requis." });
-                    return;
-                }
-
-                using var connection = GetLdapConnection(cfg);
-                if (!BindServiceAccount(connection, cfg))
-                {
-                    http.Response.StatusCode = 500;
-                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
-                    return;
-                }
-
-                // 1) Résoudre l’utilisateur vers un DN (comme avant)
-                string userDn = req.User.Contains("DC=", StringComparison.OrdinalIgnoreCase)
-                    ? req.User
-                    : (SearchUserBySam(cfg, req.User) as dynamic)?.dn;
-
-                if (string.IsNullOrWhiteSpace(userDn))
-                {
-                    http.Response.StatusCode = 404;
-                    await http.Response.WriteAsJsonAsync(new { error = "Utilisateur introuvable." });
-                    return;
-                }
-
-                // 2) Résoudre le groupe (accepte DN, CN, sAM, name)
-                var groupDn = ResolveGroupDn(cfg, connection, req.GroupDn);
-                if (string.IsNullOrWhiteSpace(groupDn))
-                {
-                    http.Response.StatusCode = 404;
-                    await http.Response.WriteAsJsonAsync(new { error = "Groupe introuvable." });
-                    return;
-                }
-
-                // 3) Idempotence : si pas membre, on renvoie succès
-                if (!IsUserMemberOfGroup(connection, groupDn, userDn))
-                {
-                    await http.Response.WriteAsJsonAsync(new
-                    {
-                        success = true,
-                        note = "L’utilisateur n’était pas membre du groupe."
-                    });
-                    return;
-                }
-
-                // 4) Suppression de l’attribut member
-                var mod = new DirectoryAttributeModification
-                {
-                    Operation = DirectoryAttributeOperation.Delete,
-                    Name = "member"
-                };
-                mod.Add(userDn);
-
-                var mreq = new ModifyRequest(groupDn, mod);
-                _ = (ModifyResponse)connection.SendRequest(mreq);
-
-                await http.Response.WriteAsJsonAsync(new { success = true });
-            }
-            catch (DirectoryOperationException doe)
-            {
-                // Certains contrôleurs renvoient "No such attribute" si la valeur n’existe plus : considérer OK
-                var msg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
-                if (msg.IndexOf("No such attribute", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    await http.Response.WriteAsJsonAsync(new { success = true, note = "Valeur 'member' absente (déjà retiré)." });
-                    return;
-                }
-
-                Log.Error(doe, "[POST /admin/removeFromGroup] DirectoryOperationException");
-                http.Response.StatusCode = 400;
-                await http.Response.WriteAsJsonAsync(new { error = doe.Message, serverError = doe.Response?.ErrorMessage });
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, "[POST /admin/removeFromGroup] Exception");
-                http.Response.StatusCode = 500;
-                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
-            }
-        });
-
         // POST /admin/updateUser
         app.MapPost("/admin/updateUser", async (HttpContext http) =>
         {
@@ -2462,8 +2540,8 @@ public class Program
                     {
                         http.Response.StatusCode = 400;
                         await http.Response.WriteAsJsonAsync(new { error = "description trop longue (max 1024 caractères)" });
-                        return;
-                    }
+                    return;
+                }
 
                     var m = new DirectoryAttributeModification { Name = attrName };
                     if (!string.IsNullOrEmpty(val))
@@ -2487,21 +2565,21 @@ public class Program
                 try
                 {
                     var mreq = new ModifyRequest(userDn, mods.ToArray());
-                    _ = (ModifyResponse)connection.SendRequest(mreq);
-                }
-                catch (DirectoryOperationException doe)
-                {
+                _ = (ModifyResponse)connection.SendRequest(mreq);
+            }
+            catch (DirectoryOperationException doe)
+            {
                     // Idempotence : supprimer un attribut déjà absent -> considérer OK
                     var serverMsg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
                     if (serverMsg.IndexOf("No such attribute", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         await http.Response.WriteAsJsonAsync(new { success = true, dn = userDn, note = "Certains attributs étaient déjà absents." });
-                        return;
-                    }
+                    return;
+                }
 
                     Log.Error(doe, "[POST /admin/updateUser] DirectoryOperationException");
-                    http.Response.StatusCode = 400;
-                    await http.Response.WriteAsJsonAsync(new { error = doe.Message, serverError = doe.Response?.ErrorMessage });
+                http.Response.StatusCode = 400;
+                await http.Response.WriteAsJsonAsync(new { error = doe.Message, serverError = doe.Response?.ErrorMessage });
                     return;
                 }
 
@@ -2626,6 +2704,836 @@ public class Program
             }
         });
 
+        // GET /meta/ad  — métadonnées AD utiles au client
+        app.MapGet("/meta/ad", async (HttpContext http) =>
+        {
+            try
+            {
+                var explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    baseDn = explorerBaseDn,
+                    groupBaseDn = EffectiveGroupBaseDn(cfg),
+                    rootDn = cfg.Ldap.RootDn
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /meta/ad] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // GET /recovery/lookup
+        // Recherche ciblée pour le flux "mot de passe oublié" (évite de parcourir /users côté PHP).
+        app.MapGet("/recovery/lookup", async (HttpContext http) =>
+        {
+            try
+            {
+                var identifier = (http.Request.Query["identifier"].FirstOrDefault() ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(identifier))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "identifier requis." });
+                    return;
+                }
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                bool byMail = identifier.Contains('@');
+                SearchRequest req;
+                if (byMail)
+                {
+                    var safe = EscapeLdapFilterValue(identifier);
+                    req = new SearchRequest(
+                        cfg.Ldap.BaseDn,
+                        $"(&(&(objectCategory=person)(objectClass=user))(mail={safe}))",
+                        SearchScope.Subtree,
+                        new[] { "sAMAccountName", "givenName", "mail", "telephoneNumber" });
+                    req.SizeLimit = 1;
+                }
+                else
+                {
+                    var normalizedId = NormalizeFrenchPhone(identifier);
+                    if (string.IsNullOrWhiteSpace(normalizedId))
+                    {
+                        await http.Response.WriteAsJsonAsync(new { found = false });
+                        return;
+                    }
+
+                    // Cible d'abord les entrées qui exposent un téléphone, puis on compare après normalisation.
+                    req = new SearchRequest(
+                        cfg.Ldap.BaseDn,
+                        "(&(&(objectCategory=person)(objectClass=user))(telephoneNumber=*))",
+                        SearchScope.Subtree,
+                        new[] { "sAMAccountName", "givenName", "mail", "telephoneNumber" });
+                }
+
+                var resp = await Task.Run(() => (SearchResponse)connection.SendRequest(req));
+                SearchResultEntry? hit = null;
+
+                if (byMail)
+                {
+                    hit = resp.Entries.Count > 0 ? resp.Entries[0] : null;
+                }
+                else
+                {
+                    var normalizedId = NormalizeFrenchPhone(identifier);
+                    foreach (SearchResultEntry e in resp.Entries)
+                    {
+                        var phone = e.Attributes["telephoneNumber"]?[0]?.ToString();
+                        var n = NormalizeFrenchPhone(phone);
+                        if (!string.IsNullOrWhiteSpace(n) &&
+                            string.Equals(n, normalizedId, StringComparison.Ordinal))
+                        {
+                            hit = e;
+                            break;
+                        }
+                    }
+                }
+
+                if (hit is null)
+                {
+                    await http.Response.WriteAsJsonAsync(new { found = false });
+                    return;
+                }
+
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    found = true,
+                    sam = hit.Attributes["sAMAccountName"]?[0]?.ToString(),
+                    givenName = hit.Attributes["givenName"]?[0]?.ToString(),
+                    mail = hit.Attributes["mail"]?[0]?.ToString(),
+                    telephoneNumber = hit.Attributes["telephoneNumber"]?[0]?.ToString()
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /recovery/lookup] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // GET /explorer/search?q=<term>&type=<all|user|inetorgperson|group|computer|ou|container|domain>&max=200
+        app.MapGet("/explorer/search", async (HttpContext http) =>
+        {
+            try
+            {
+                var q = (http.Request.Query["q"].FirstOrDefault() ?? "").Trim();
+                var type = (http.Request.Query["type"].FirstOrDefault() ?? "all").Trim().ToLowerInvariant();
+                int max = 200;
+                if (int.TryParse(http.Request.Query["max"], out var m) && m > 0 && m <= 2000) max = m;
+
+                string typeFilter = type switch
+                {
+                    "user" => "(&(objectCategory=person)(objectClass=user))",
+                    "inetorgperson" => "(objectClass=inetOrgPerson)",
+                    "group" => "(objectClass=group)",
+                    "computer" => "(objectClass=computer)",
+                    "ou" => "(objectClass=organizationalUnit)",
+                    "container" => "(objectClass=container)",
+                    "domain" => "(objectClass=domainDNS)",
+                    _ => "(|(objectClass=organizationalUnit)(objectClass=container)(objectClass=group)(objectClass=computer)(objectClass=domainDNS)(&(objectCategory=person)(|(objectClass=user)(objectClass=inetOrgPerson))))"
+                };
+
+                string textFilter;
+                if (string.IsNullOrWhiteSpace(q) || q == "*")
+                {
+                    textFilter = "(objectClass=*)";
+                }
+                else
+                {
+                    var safe = EscapeLdapFilterValue(q);
+                    textFilter = $"(|(name=*{safe}*)(cn=*{safe}*)(ou=*{safe}*)(sAMAccountName=*{safe}*)(userPrincipalName=*{safe}*)(distinguishedName=*{safe}*))";
+                }
+
+                var explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var req = new SearchRequest(
+                    explorerBaseDn,
+                    $"(&{typeFilter}{textFilter})",
+                    SearchScope.Subtree,
+                    new[] { "distinguishedName", "name", "cn", "ou", "description", "objectClass", "sAMAccountName" });
+                req.SizeLimit = max;
+                var resp = (SearchResponse)connection.SendRequest(req);
+
+                var rows = resp.Entries.Cast<SearchResultEntry>()
+                    .Where(e => DnIsUnder(e.DistinguishedName, explorerBaseDn))
+                    .Select(e =>
+                    {
+                        var dn = e.DistinguishedName;
+                        var parentDn = ParentDnOf(dn);
+                        return new
+                        {
+                            name = GetNameFromEntry(e),
+                            dn,
+                            parentDn,
+                            type = GetNodeTypeFromEntry(e),
+                            objectClasses = GetObjectClassesFromEntry(e),
+                            samAccountName = e.Attributes["sAMAccountName"]?[0]?.ToString(),
+                            description = e.Attributes["description"]?[0]?.ToString()
+                        };
+                    })
+                    .OrderBy(x => x.dn, StringComparer.OrdinalIgnoreCase)
+                    .Take(max)
+                    .ToList();
+
+                    await http.Response.WriteAsJsonAsync(new
+                    {
+                    query = q,
+                    type,
+                    max,
+                    count = rows.Count,
+                    results = rows
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /explorer/search] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // GET /explorer/group-search?q=<term>&scope=<all|explorer|groups>&max=100
+        app.MapGet("/explorer/group-search", async (HttpContext http) =>
+        {
+            try
+            {
+                var q = (http.Request.Query["q"].FirstOrDefault() ?? "").Trim();
+                var scope = (http.Request.Query["scope"].FirstOrDefault() ?? "all").Trim().ToLowerInvariant();
+                int max = 100;
+                if (int.TryParse(http.Request.Query["max"], out var m) && m > 0 && m <= 2000) max = m;
+
+                var explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+                var groupBaseDn = EffectiveGroupBaseDn(cfg);
+                var searchBase = scope switch
+                {
+                    "explorer" => explorerBaseDn,
+                    "groups" => groupBaseDn,
+                    _ => cfg.Ldap.RootDn
+                };
+
+                var textFilter = string.IsNullOrWhiteSpace(q) || q == "*"
+                    ? "(objectClass=*)"
+                    : $"(|(cn=*{EscapeLdapFilterValue(q)}*)(sAMAccountName=*{EscapeLdapFilterValue(q)}*)(name=*{EscapeLdapFilterValue(q)}*)(distinguishedName=*{EscapeLdapFilterValue(q)}*))";
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var req = new SearchRequest(
+                    searchBase,
+                    $"(&(objectClass=group){textFilter})",
+                    SearchScope.Subtree,
+                    new[] { "objectGUID", "cn", "name", "sAMAccountName", "distinguishedName", "description", "objectClass" });
+                req.SizeLimit = max;
+                var resp = (SearchResponse)connection.SendRequest(req);
+
+                var rows = resp.Entries.Cast<SearchResultEntry>()
+                    // scope=all => RootDn, scope=groups => GroupBaseDn, scope=explorer => BaseDn explorateur
+                    .Where(e => DnIsUnder(e.DistinguishedName, searchBase))
+                    .Select(e =>
+                    {
+                        byte[]? guidBin = e.Attributes["objectGUID"]?[0] as byte[];
+                        Guid? guid = guidBin != null ? new Guid(guidBin) : (Guid?)null;
+                        return new
+                        {
+                            id = guid,
+                            name = e.Attributes["cn"]?[0]?.ToString() ?? e.Attributes["name"]?[0]?.ToString(),
+                            sam = e.Attributes["sAMAccountName"]?[0]?.ToString(),
+                            dn = e.Attributes["distinguishedName"]?[0]?.ToString() ?? e.DistinguishedName,
+                            description = e.Attributes["description"]?[0]?.ToString(),
+                            type = GetNodeTypeFromEntry(e)
+                        };
+                    })
+                    .OrderBy(x => x.name ?? x.dn, StringComparer.OrdinalIgnoreCase)
+                    .Take(max)
+                    .ToList();
+
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    query = q,
+                    scope,
+                    max,
+                    count = rows.Count,
+                    results = rows
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /explorer/group-search] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // GET /explorer/user-search?q=<term>&max=50
+        app.MapGet("/explorer/user-search", async (HttpContext http) =>
+        {
+            try
+            {
+                var q = (http.Request.Query["q"].FirstOrDefault() ?? "").Trim();
+                int max = 50;
+                if (int.TryParse(http.Request.Query["max"], out var m) && m > 0 && m <= 1000) max = m;
+
+                string textFilter = string.IsNullOrWhiteSpace(q) || q == "*"
+                    ? "(objectClass=*)"
+                    : $"(|(cn=*{EscapeLdapFilterValue(q)}*)(name=*{EscapeLdapFilterValue(q)}*)(sAMAccountName=*{EscapeLdapFilterValue(q)}*)(userPrincipalName=*{EscapeLdapFilterValue(q)}*)(distinguishedName=*{EscapeLdapFilterValue(q)}*))";
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var req = new SearchRequest(
+                    EffectiveExplorerBaseDn(cfg),
+                    $"(&(&(objectCategory=person)(|(objectClass=user)(objectClass=inetOrgPerson))){textFilter})",
+                    SearchScope.Subtree,
+                    new[] { "distinguishedName", "cn", "name", "sAMAccountName", "userPrincipalName", "objectClass" });
+                req.SizeLimit = max;
+                var resp = (SearchResponse)connection.SendRequest(req);
+
+                var rows = resp.Entries.Cast<SearchResultEntry>()
+                    .Where(e => DnIsUnder(e.DistinguishedName, EffectiveExplorerBaseDn(cfg)))
+                    .Select(e => new
+                    {
+                        name = e.Attributes["cn"]?[0]?.ToString() ?? e.Attributes["name"]?[0]?.ToString(),
+                        sam = e.Attributes["sAMAccountName"]?[0]?.ToString(),
+                        upn = e.Attributes["userPrincipalName"]?[0]?.ToString(),
+                        dn = e.DistinguishedName,
+                        type = GetNodeTypeFromEntry(e)
+                    })
+                    .OrderBy(x => x.name ?? x.sam ?? x.dn, StringComparer.OrdinalIgnoreCase)
+                    .Take(max)
+                    .ToList();
+
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    query = q,
+                    max,
+                    count = rows.Count,
+                    results = rows
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /explorer/user-search] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // GET /explorer/user-groups?user=<sAM|DN>
+        app.MapGet("/explorer/user-groups", async (HttpContext http) =>
+        {
+            try
+            {
+                var user = (http.Request.Query["user"].FirstOrDefault() ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(user))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "user requis." });
+                    return;
+                }
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var userDn = ResolveUserDn(cfg, connection, user);
+                if (string.IsNullOrWhiteSpace(userDn))
+                {
+                    http.Response.StatusCode = 404;
+                    await http.Response.WriteAsJsonAsync(new { error = "Utilisateur introuvable." });
+                    return;
+                }
+
+                var direct = GetDirectUserGroupDns(connection, userDn);
+                var groups = direct.Select(dn => GroupDtoFromDn(connection, dn)).ToList();
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    user = userDn,
+                    count = groups.Count,
+                    groups
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /explorer/user-groups] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // POST /explorer/user-groups/set  Body: { user, groups[] }
+        app.MapPost("/explorer/user-groups/set", async (HttpContext http) =>
+        {
+            try
+            {
+                var req = await http.Request.ReadFromJsonAsync<SetUserGroupsRequest>();
+                if (req is null || string.IsNullOrWhiteSpace(req.User))
+                    {
+                        http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "user requis." });
+                        return;
+                    }
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var userDn = ResolveUserDn(cfg, connection, req.User);
+                if (string.IsNullOrWhiteSpace(userDn))
+                {
+                    http.Response.StatusCode = 404;
+                    await http.Response.WriteAsJsonAsync(new { error = "Utilisateur introuvable." });
+                    return;
+                }
+
+                var current = new HashSet<string>(GetDirectUserGroupDns(connection, userDn), StringComparer.OrdinalIgnoreCase);
+                var target = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var input in req.Groups ?? new List<string>())
+                {
+                    var raw = (input ?? "").Trim();
+                    if (string.IsNullOrWhiteSpace(raw)) continue;
+                    var groupDn = ResolveGroupDn(cfg, connection, raw);
+                    if (!string.IsNullOrWhiteSpace(groupDn)) target.Add(groupDn);
+                }
+
+                var toAdd = target.Except(current, StringComparer.OrdinalIgnoreCase).ToList();
+                var toRemove = current.Except(target, StringComparer.OrdinalIgnoreCase).ToList();
+
+                foreach (var gdn in toAdd)
+                {
+                    var mod = new DirectoryAttributeModification { Operation = DirectoryAttributeOperation.Add, Name = "member" };
+                    mod.Add(userDn);
+                    _ = (ModifyResponse)connection.SendRequest(new ModifyRequest(gdn, mod));
+                }
+                foreach (var gdn in toRemove)
+                {
+                    var mod = new DirectoryAttributeModification { Operation = DirectoryAttributeOperation.Delete, Name = "member" };
+                    mod.Add(userDn);
+                    try
+                    {
+                        _ = (ModifyResponse)connection.SendRequest(new ModifyRequest(gdn, mod));
+                }
+                catch (DirectoryOperationException doe)
+                {
+                        var msg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
+                        if (msg.IndexOf("No such attribute", StringComparison.OrdinalIgnoreCase) < 0
+                            && doe.Response?.ResultCode != ResultCode.NoSuchAttribute)
+                        {
+                            throw;
+                        }
+                    }
+                }
+
+                var updated = GetDirectUserGroupDns(connection, userDn).Select(dn => GroupDtoFromDn(connection, dn)).ToList();
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    success = true,
+                    user = userDn,
+                    addedCount = toAdd.Count,
+                    removedCount = toRemove.Count,
+                    count = updated.Count,
+                    groups = updated
+                });
+            }
+            catch (DirectoryOperationException doe)
+            {
+                Log.Error(doe, "[POST /explorer/user-groups/set] DirectoryOperationException");
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = doe.Message, serverError = doe.Response?.ErrorMessage });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[POST /explorer/user-groups/set] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // GET /explorer/group-members?group=<dn|sam|cn>
+        app.MapGet("/explorer/group-members", async (HttpContext http) =>
+        {
+            try
+            {
+                var group = (http.Request.Query["group"].FirstOrDefault() ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(group))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "group requis." });
+                    return;
+                }
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var groupDn = ResolveGroupDn(cfg, connection, group);
+                if (string.IsNullOrWhiteSpace(groupDn))
+                {
+                    http.Response.StatusCode = 404;
+                    await http.Response.WriteAsJsonAsync(new { error = "Groupe introuvable." });
+                    return;
+                }
+
+                var members = GetDirectGroupMemberDns(connection, groupDn).Select(dn =>
+                {
+                    if (!TryGetEntry(connection, dn, out var u, new[] { "distinguishedName", "cn", "name", "sAMAccountName", "userPrincipalName", "objectClass" }) || u is null)
+                    {
+                        return new { name = DnToCn(dn) ?? dn, sam = (string?)null, upn = (string?)null, dn, type = "other" };
+                    }
+                    return new
+                    {
+                        name = u.Attributes["cn"]?[0]?.ToString() ?? u.Attributes["name"]?[0]?.ToString() ?? DnToCn(u.DistinguishedName) ?? u.DistinguishedName,
+                        sam = u.Attributes["sAMAccountName"]?[0]?.ToString(),
+                        upn = u.Attributes["userPrincipalName"]?[0]?.ToString(),
+                        dn = u.DistinguishedName,
+                        type = GetNodeTypeFromEntry(u)
+                    };
+                }).ToList();
+
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    group = groupDn,
+                    count = members.Count,
+                    members
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /explorer/group-members] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // POST /explorer/group-members/set  Body: { group, members[] }
+        app.MapPost("/explorer/group-members/set", async (HttpContext http) =>
+        {
+            try
+            {
+                var req = await http.Request.ReadFromJsonAsync<SetGroupMembersRequest>();
+                if (req is null || string.IsNullOrWhiteSpace(req.Group))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "group requis." });
+                    return;
+                }
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var groupDn = ResolveGroupDn(cfg, connection, req.Group);
+                if (string.IsNullOrWhiteSpace(groupDn))
+                {
+                    http.Response.StatusCode = 404;
+                    await http.Response.WriteAsJsonAsync(new { error = "Groupe introuvable." });
+                    return;
+                }
+
+                var current = new HashSet<string>(GetDirectGroupMemberDns(connection, groupDn), StringComparer.OrdinalIgnoreCase);
+                var target = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var input in req.Members ?? new List<string>())
+                {
+                    var raw = (input ?? "").Trim();
+                    if (string.IsNullOrWhiteSpace(raw)) continue;
+                    var userDn = ResolveUserDn(cfg, connection, raw);
+                    if (!string.IsNullOrWhiteSpace(userDn)) target.Add(userDn);
+                }
+
+                var toAdd = target.Except(current, StringComparer.OrdinalIgnoreCase).ToList();
+                var toRemove = current.Except(target, StringComparer.OrdinalIgnoreCase).ToList();
+                foreach (var userDn in toAdd)
+                {
+                    var mod = new DirectoryAttributeModification { Operation = DirectoryAttributeOperation.Add, Name = "member" };
+                    mod.Add(userDn);
+                    _ = (ModifyResponse)connection.SendRequest(new ModifyRequest(groupDn, mod));
+                }
+                foreach (var userDn in toRemove)
+                {
+                    var mod = new DirectoryAttributeModification { Operation = DirectoryAttributeOperation.Delete, Name = "member" };
+                    mod.Add(userDn);
+                    try
+                    {
+                        _ = (ModifyResponse)connection.SendRequest(new ModifyRequest(groupDn, mod));
+                    }
+                    catch (DirectoryOperationException doe)
+                    {
+                        var msg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
+                        if (msg.IndexOf("No such attribute", StringComparison.OrdinalIgnoreCase) < 0
+                            && doe.Response?.ResultCode != ResultCode.NoSuchAttribute)
+                        {
+                            throw;
+                        }
+                    }
+                }
+
+                var updated = GetDirectGroupMemberDns(connection, groupDn);
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    success = true,
+                    group = groupDn,
+                    addedCount = toAdd.Count,
+                    removedCount = toRemove.Count,
+                    count = updated.Count
+                });
+            }
+            catch (DirectoryOperationException doe)
+            {
+                Log.Error(doe, "[POST /explorer/group-members/set] DirectoryOperationException");
+                http.Response.StatusCode = 400;
+                await http.Response.WriteAsJsonAsync(new { error = doe.Message, serverError = doe.Response?.ErrorMessage });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[POST /explorer/group-members/set] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // GET /explorer/object?dn=<DN>  — détails d’un objet AD
+        app.MapGet("/explorer/object", async (HttpContext http) =>
+        {
+            try
+            {
+                var dn = (http.Request.Query["dn"].FirstOrDefault() ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(dn))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "dn requis." });
+                    return;
+                }
+
+                var explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+                if (!DnIsUnder(dn, explorerBaseDn))
+                {
+                    http.Response.StatusCode = 403;
+                    await http.Response.WriteAsJsonAsync(new { error = "dn hors baseDn." });
+                    return;
+                }
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var attrs = new[]
+                {
+                    "distinguishedName", "name", "cn", "ou", "description",
+                    "objectClass", "objectCategory", "sAMAccountName", "userPrincipalName",
+                    "mail", "givenName", "sn", "telephoneNumber", "memberOf", "member",
+                    "whenCreated", "whenChanged", "userAccountControl", "isCriticalSystemObject",
+                    "adminDescription", "lockoutTime", "pwdLastSet",
+                    "dNSHostName", "operatingSystem", "operatingSystemVersion", "managedBy",
+                    "streetAddress", "wWWHomePage", "lastLogonTimestamp", "lastLogon"
+                };
+                if (!TryGetEntry(connection, dn, out var entry, attrs) || entry is null)
+                {
+                    http.Response.StatusCode = 404;
+                    await http.Response.WriteAsJsonAsync(new { error = "Objet introuvable." });
+                    return;
+                }
+
+                var type = GetNodeTypeFromEntry(entry);
+                var objectClasses = GetObjectClassesFromEntry(entry);
+                var underBaseDn = DnIsUnder(dn, explorerBaseDn);
+
+                bool isDisabled = false;
+                var uacStr = entry.Attributes["userAccountControl"]?[0]?.ToString();
+                if (int.TryParse(uacStr, out var uac))
+                {
+                    isDisabled = (uac & 0x0002) != 0;
+                }
+
+                var members = entry.Attributes["member"]?.GetValues(typeof(string)).Cast<string>().ToArray()
+                              ?? Array.Empty<string>();
+                var memberOf = entry.Attributes["memberOf"]?.GetValues(typeof(string)).Cast<string>().ToArray()
+                               ?? Array.Empty<string>();
+                var dnsHostName = entry.Attributes["dNSHostName"]?[0]?.ToString();
+                var hostIps = await ResolveHostIpsAsync(dnsHostName);
+                var whenCreatedRaw = entry.Attributes["whenCreated"]?[0]?.ToString();
+                var whenChangedRaw = entry.Attributes["whenChanged"]?[0]?.ToString();
+                var createdAtUtc = ParseAdGeneralizedTimeUtc(whenCreatedRaw);
+                var changedAtUtc = ParseAdGeneralizedTimeUtc(whenChangedRaw);
+                var lastLogonTsRaw = entry.Attributes["lastLogonTimestamp"]?[0]?.ToString();
+                var lastLogonRaw = entry.Attributes["lastLogon"]?[0]?.ToString();
+                var lastBindAtUtc = ParseAdFileTimeUtc(lastLogonRaw) ?? ParseAdFileTimeUtc(lastLogonTsRaw);
+
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    dn,
+                    type,
+                    objectClasses,
+                    underBaseDn,
+                    protectedOu = type == "ou" ? OuIsProtected(connection, dn) : false,
+                    isDisabled,
+                    capabilities = BuildExplorerCapabilities(type, underBaseDn),
+                    attributes = new
+                    {
+                        name = entry.Attributes["name"]?[0]?.ToString(),
+                        cn = entry.Attributes["cn"]?[0]?.ToString(),
+                        ou = entry.Attributes["ou"]?[0]?.ToString(),
+                        description = entry.Attributes["description"]?[0]?.ToString(),
+                        samAccountName = entry.Attributes["sAMAccountName"]?[0]?.ToString(),
+                        userPrincipalName = entry.Attributes["userPrincipalName"]?[0]?.ToString(),
+                        mail = entry.Attributes["mail"]?[0]?.ToString(),
+                        givenName = entry.Attributes["givenName"]?[0]?.ToString(),
+                        sn = entry.Attributes["sn"]?[0]?.ToString(),
+                        telephoneNumber = entry.Attributes["telephoneNumber"]?[0]?.ToString(),
+                        streetAddress = entry.Attributes["streetAddress"]?[0]?.ToString(),
+                        website = entry.Attributes["wWWHomePage"]?[0]?.ToString(),
+                        whenCreated = whenCreatedRaw,
+                        whenChanged = whenChangedRaw,
+                        createdAtUtc = createdAtUtc?.ToString("o"),
+                        changedAtUtc = changedAtUtc?.ToString("o"),
+                        isCriticalSystemObject = entry.Attributes["isCriticalSystemObject"]?[0]?.ToString(),
+                        adminDescription = entry.Attributes["adminDescription"]?[0]?.ToString(),
+                        lockoutTime = entry.Attributes["lockoutTime"]?[0]?.ToString(),
+                        pwdLastSet = entry.Attributes["pwdLastSet"]?[0]?.ToString(),
+                        dnsHostName = dnsHostName,
+                        ipAddresses = hostIps,
+                        operatingSystem = entry.Attributes["operatingSystem"]?[0]?.ToString(),
+                        operatingSystemVersion = entry.Attributes["operatingSystemVersion"]?[0]?.ToString(),
+                        managedBy = entry.Attributes["managedBy"]?[0]?.ToString(),
+                        lastLogonTimestamp = lastLogonTsRaw,
+                        lastLogon = lastLogonRaw,
+                        lastBindAtUtc = lastBindAtUtc?.ToString("o"),
+                        lastUserConnected = entry.Attributes["managedBy"]?[0]?.ToString(),
+                        memberCount = members.Length,
+                        memberOfCount = memberOf.Length,
+                        memberOf
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /explorer/object] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
+        // GET /explorer/children?dn=<DN>&max=200  — enfants directs d’un objet
+        app.MapGet("/explorer/children", async (HttpContext http) =>
+        {
+            try
+            {
+                var dn = (http.Request.Query["dn"].FirstOrDefault() ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(dn))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "dn requis." });
+                    return;
+                }
+
+                int max = 200;
+                if (int.TryParse(http.Request.Query["max"], out var m) && m > 0 && m <= 1000) max = m;
+
+                var explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+                if (!DnIsUnder(dn, explorerBaseDn))
+                {
+                    http.Response.StatusCode = 403;
+                    await http.Response.WriteAsJsonAsync(new { error = "dn hors baseDn." });
+                    return;
+                }
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var req = new SearchRequest(
+                    dn,
+                    "(objectClass=*)",
+                    SearchScope.OneLevel,
+                    new[] { "distinguishedName", "name", "cn", "ou", "description", "objectClass" });
+                req.SizeLimit = max;
+                var resp = (SearchResponse)connection.SendRequest(req);
+
+                var children = resp.Entries.Cast<SearchResultEntry>()
+                    .Select(e =>
+                    {
+                        var childType = GetNodeTypeFromEntry(e);
+                        var childDn = e.DistinguishedName;
+                        return new
+                        {
+                            name = GetNameFromEntry(e),
+                            dn = childDn,
+                            type = childType,
+                            objectClasses = GetObjectClassesFromEntry(e),
+                            description = e.Attributes["description"]?[0]?.ToString(),
+                            hasChildren = NodeHasAnyChildren(connection, childDn),
+                            underBaseDn = DnIsUnder(childDn, explorerBaseDn)
+                        };
+                    })
+                    .OrderBy(x => x.name, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                await http.Response.WriteAsJsonAsync(new
+                {
+                    dn,
+                    count = children.Count,
+                    max,
+                    children
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[GET /explorer/children] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
         // GET /tree  — arborescence à partir d’un DN
         app.MapGet("/tree", async (HttpContext http) =>
         {
@@ -2640,8 +3548,14 @@ public class Program
                 }
 
                 // Paramètres
-                string baseDn = http.Request.Query["baseDn"].FirstOrDefault()
-                                ?? (string.IsNullOrWhiteSpace(cfg.Ldap.BaseDn) ? cfg.Ldap.RootDn : cfg.Ldap.BaseDn);
+                string explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+                string baseDn = http.Request.Query["baseDn"].FirstOrDefault() ?? explorerBaseDn;
+                if (!DnIsUnder(baseDn, explorerBaseDn))
+                {
+                    http.Response.StatusCode = 403;
+                    await http.Response.WriteAsJsonAsync(new { error = "baseDn hors périmètre autorisé." });
+                    return;
+                }
 
                 int depth = 3;
                 if (int.TryParse(http.Request.Query["depth"], out var d) && d >= 1 && d <= 10) depth = d;
@@ -2657,6 +3571,7 @@ public class Program
                 await http.Response.WriteAsJsonAsync(new
                 {
                     baseDn,
+                    explorerBaseDn,
                     depth,
                     includeLeaves,
                     maxChildren,

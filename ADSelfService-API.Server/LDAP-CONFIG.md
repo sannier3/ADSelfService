@@ -1,3 +1,104 @@
+# Configuration LDAP / AD
+
+Ce guide explique comment configurer la connexion AD pour `ADSelfService-API.Server` de façon fiable et sécurisée.
+
+## Principe clé
+
+Le runtime impose désormais un transport LDAP protégé. Vous devez utiliser:
+
+- **LDAPS** (`Ssl=true`, port `636`), ou
+- **LDAP + Kerberos sealing** (`Ssl=false`, `UseKerberosSealing=true`, port `389`).
+
+La combinaison non protégée (`Ssl=false` et `UseKerberosSealing=false`) est refusée.
+
+## Choix recommandé
+
+| Contexte | Recommandation |
+|---|---|
+| Certificat AD valide et port 636 ouvert | LDAPS |
+| Pas de LDAPS, environnement Kerberos maîtrisé | LDAP + Kerberos sealing |
+
+## Option 1 - LDAPS (recommandé production)
+
+```json
+{
+  "Ldap": {
+    "Url": "dc01.example.local",
+    "Port": 636,
+    "Ssl": true,
+    "UseKerberosSealing": false,
+    "IgnoreCertificate": false,
+    "BindDn": "svc-adselfservice@example.local",
+    "BindPassword": "mot-de-passe",
+    "BaseDn": "OU=Infra,DC=example,DC=local",
+    "GroupBaseDn": "DC=example,DC=local",
+    "RootDn": "DC=example,DC=local",
+    "AdminGroupDn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local"
+  }
+}
+```
+
+### Bonnes pratiques
+
+- Utilisez un certificat valide côté contrôleur de domaine.
+- Laissez `IgnoreCertificate=false` hors labo.
+- Gardez `BindDn` au format `user@domaine` ou `DOMAINE\\user`.
+
+## Option 2 - LDAP + Kerberos sealing
+
+```json
+{
+  "Ldap": {
+    "Url": "dc01.example.local",
+    "Port": 389,
+    "Ssl": false,
+    "UseKerberosSealing": true,
+    "IgnoreCertificate": true,
+    "BindDn": "svc-adselfservice@example.local",
+    "BindPassword": "mot-de-passe",
+    "BaseDn": "OU=Infra,DC=example,DC=local",
+    "GroupBaseDn": "DC=example,DC=local",
+    "RootDn": "DC=example,DC=local",
+    "AdminGroupDn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local"
+  }
+}
+```
+
+### Points d'attention
+
+- `Url` doit être le FQDN du DC (pas l'IP) pour éviter les soucis Kerberos/SPN.
+- La machine qui héberge l'API doit résoudre le DC correctement.
+- Le compte de service doit pouvoir s'authentifier Kerberos.
+
+## Champs LDAP essentiels
+
+| Champ | Rôle |
+|---|---|
+| `BaseDn` | périmètre principal de recherche/exploration |
+| `GroupBaseDn` | base spécifique recherche groupes |
+| `RootDn` | racine domaine (utile pour recherches globales) |
+| `AdminGroupDn` | groupe logique admin côté API |
+
+## Symptômes fréquents et diagnostic
+
+| Symptôme | Vérification |
+|---|---|
+| Échec au démarrage | config LDAP incomplète, mode non protégé, port inaccessible |
+| `Bind LDAP échoué` | `BindDn`/`BindPassword` invalides, ACL AD, DNS |
+| Changement mot de passe refusé | absence de LDAPS ou Kerberos sealing |
+| Erreurs Kerberos sur port 389 | FQDN incorrect, SPN/résolution DNS |
+
+## Checklist de validation
+
+1. `GET /health` retourne `200`.
+2. `POST /auth` réussit avec un compte valide.
+3. `POST /user/changePassword` fonctionne.
+4. Les endpoints `explorer/*` répondent dans le bon périmètre DN.
+
+## Voir aussi
+
+- [../ENDPOINTS.md](../ENDPOINTS.md)
+- [../../CONFIG-OPTIONS.md](../../CONFIG-OPTIONS.md)
 # Connexion LDAP
 
 L'API peut se connecter à Active Directory de deux façons :

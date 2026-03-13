@@ -64,6 +64,7 @@ rl_logs/
 # IDE / OS
 # ==============================
 .idea/
+.cursor/
 *.suo
 *.ntvs*
 *.njsproj

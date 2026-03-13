@@ -1,130 +1,76 @@
-## Endpoint reference
+# API endpoint reference
 
-All endpoints return JSON. This API does not include JWT or HTTP session handling.
+All endpoints return JSON.
 
-### Transport security
+## Access security (before endpoint logic)
 
-Before any endpoint logic runs, the API applies:
+Before business logic executes, the API applies:
 
-- IP filtering based on `Security.AllowedIps`
-- an optional shared‑secret check on the `X-Internal-Auth` header when `InternalSharedSecret` is configured
+- IP filtering (`Security.AllowedIps`),
+- `X-Internal-Auth` shared-secret check (when configured),
+- app-context check via `X-App-Context` (when `RequireAppContextHeader=true`).
 
-`GET /health` is the only endpoint that does not require `X-Internal-Auth`, but it is still IP‑filtered.
+`/health` is exempt from app-context checks, but still IP-filtered.
 
-Important: the `isAdmin` flag returned by `/auth` is intended for clients. The `/admin/*` routes must only be reachable from trusted internal callers.
+## Expected app contexts
 
-### Common conventions
+Examples used by the PHP client:
 
-- Many user parameters accept either a `sAMAccountName` or a full DN.
-- Group identifiers may be resolved as DN, CN, `sAMAccountName`, or `name` depending on the endpoint.
-- Dates are expected in ISO 8601 format.
-- When pagination is enabled, `GET /users` and `GET /groups` expose `X-Page`, `X-Page-Size`, and `X-Has-More` headers.
+- `intranet-login`: login (`/auth`),
+- `self-service`: standard user endpoints,
+- `admin-user`: user administration endpoints,
+- `admin-domain`: domain/explorer administration endpoints,
+- `forgot-reset`: forgot-password flow.
 
-## Health
+Wrong context can return `403`.
+
+## Health and metadata
 
 ### `GET /health`
 
-Checks that the API can still bind to Active Directory with the service account.
+- Verifies LDAP bind status.
+- `200` when healthy, `500` otherwise.
 
-Success:
+### `GET /meta/ad`
 
-```json
-{
-  "status": "ok"
-}
-```
+- Returns metadata such as `baseDn`, `groupBaseDn`, `rootDn`.
 
-Typical status codes:
-
-- `200` – service healthy
-- `500` – LDAP bind failed
-
-## Authentication and profile
+## Authentication and self-service
 
 ### `POST /auth`
 
-Request body:
+Body:
 
 ```json
 {
   "username": "jdoe",
-  "password": "MyPassword"
+  "password": "Password"
 }
 ```
 
-Success:
-
-```json
-{
-  "success": true,
-  "user": {
-    "dn": "CN=John Doe,OU=Users,DC=example,DC=local",
-    "sAMAccountName": "jdoe",
-    "givenName": "John",
-    "sn": "Doe",
-    "mail": "john.doe@example.local",
-    "memberOf": [ "ADSyncAdmins" ],
-    "memberOfEffective": [ "ADSyncAdmins", "IT" ],
-    "objectGUID": "guid-or-null",
-    "telephoneNumber": "0102030405",
-    "wwwhomepage": "",
-    "streetAddress": ""
-  },
-  "mustChangePassword": false,
-  "isAdmin": true
-}
-```
-
-Typical status codes:
-
-- `200` – authentication succeeded
-- `400` – `username` or `password` missing
-- `401` – user not found, invalid or expired password
-- `403` – account disabled
-- `500` – LDAP or server error
+Returns `success`, `user`, `mustChangePassword`, `isAdmin`.
 
 ### `GET /user/{sam}`
 
-Returns information about the requested user.
-
-Typical status codes:
-
-- `200` – user found
-- `404` – user not found
-- `500` – server error
+- Reads a user profile.
 
 ### `POST /user/updateProfile`
 
-Updates profile attributes on a user DN.
-
-Request body:
+Body:
 
 ```json
 {
-  "dn": "CN=John Doe,OU=Users,DC=example,DC=local",
+  "dn": "CN=John Doe,OU=Infra,DC=example,DC=local",
   "modifications": {
     "mail": "john.doe@example.local",
-    "telephoneNumber": "0102030405",
-    "streetAddress": ""
+    "telephoneNumber": "+33102030405"
   }
 }
 ```
 
-Notes:
-
-- an empty string removes the attribute
-- if no modifications are provided, the API still returns `success: true` with a note
-- `description` is limited to 1024 characters
-
-Typical status codes:
-
-- `200` – profile updated or already up‑to‑date
-- `400` – invalid body or LDAP modification error
-- `500` – server error
-
 ### `POST /user/changePassword`
 
-Request body:
+Body:
 
 ```json
 {
@@ -134,399 +80,153 @@ Request body:
 }
 ```
 
-Typical status codes:
+## Forgot-password flow
 
-- `200` – password changed
-- `400` – invalid body
-- `401` – current password invalid
-- `404` – user not found
-- `500` – LDAP or server error
+### `GET /recovery/lookup?identifier=<email|phone>`
 
-## Users
+- Dedicated lookup endpoint for the reset flow.
+- Response:
+  - `{"found": false}` when no account matches,
+  - or `{"found": true, "sam": "...", "givenName": "...", ...}`.
+
+## List endpoints
 
 ### `GET /users`
 
-Query string:
+Query:
 
-- `includeBuiltins` – `true` or `false`, defaults to `false`
-- `groups` – `none`, `direct`, or `effective`, defaults to `direct`
-- `page`, `pageSize` – when pagination is enabled
-
-Success:
-
-```json
-[
-  {
-    "dn": "CN=John Doe,OU=Users,DC=example,DC=local",
-    "sAMAccountName": "jdoe",
-    "givenName": "John",
-    "sn": "Doe",
-    "mail": "john.doe@example.local",
-    "telephoneNumber": "0102030405",
-    "wwwhomepage": "",
-    "streetAddress": "",
-    "objectGUID": "guid-or-null",
-    "disabled": false,
-    "memberOf": [ "IT" ]
-  }
-]
-```
-
-Typical status codes:
-
-- `200` – list returned
-- `500` – server error
-
-## Groups
+- `includeBuiltins=true|false`,
+- `groups=none|direct|effective`,
+- `page`, `pageSize` (when pagination enabled).
 
 ### `GET /groups`
 
-Query string:
+Query:
 
-- `baseDn` – optional, defaults to `GroupBaseDn` then `RootDn`
-- `search` – filter on `cn` or `sAMAccountName`
-- `page`, `pageSize` – when pagination is enabled
-
-Success:
-
-```json
-[
-  {
-    "id": "guid-or-null",
-    "name": "ADSyncAdmins",
-    "dn": "CN=ADSyncAdmins,CN=Users,DC=example,DC=local",
-    "sam": "ADSyncAdmins"
-  }
-]
-```
-
-Typical status codes:
-
-- `200` – list returned
-- `500` – server error
-
-## Directory tree
+- `baseDn` (optional),
+- `search` (optional),
+- `page`, `pageSize`.
 
 ### `GET /tree`
 
-Query string:
+Query:
 
-- `baseDn` – optional, defaults to `BaseDn` then `RootDn`
-- `depth` – between `1` and `10`, default `3`
-- `includeLeaves` – `true` or `false`, default `false`
-- `maxChildren` – default `200`, maximum `2000`
+- `baseDn` (optional),
+- `depth` (1-10),
+- `includeLeaves=true|false`,
+- `maxChildren` (max 2000).
 
-Success:
+## AD explorer (unified contract)
+
+### `GET /explorer/search`
+
+- Multi-type search under explorer base DN.
+
+### `GET /explorer/group-search?q=&scope=&max=`
+
+- Group search.
+- `scope`:
+  - `all` => under `RootDn`,
+  - `groups` => under `GroupBaseDn`,
+  - `explorer` => under explorer `BaseDn`.
+
+### `GET /explorer/user-search?q=&max=`
+
+- User search endpoint.
+
+### `GET /explorer/user-groups?user=`
+
+- Returns direct groups for a user.
+
+### `POST /explorer/user-groups/set`
+
+Body:
 
 ```json
 {
-  "baseDn": "DC=example,DC=local",
-  "depth": 3,
-  "includeLeaves": false,
-  "maxChildren": 200,
-  "nodes": [
-    {
-      "name": "Users",
-      "dn": "OU=Users,DC=example,DC=local",
-      "type": "ou",
-      "hasChildren": true,
-      "children": []
-    }
+  "user": "jdoe",
+  "groups": [
+    "CN=ADSyncAdmins,CN=Users,DC=example,DC=local",
+    "CN=IT,OU=Groups,DC=example,DC=local"
   ]
 }
 ```
 
-Typical status codes:
+### `GET /explorer/group-members?group=`
 
-- `200` – tree returned
-- `500` – server error
+- Returns direct members of a group.
+
+### `POST /explorer/group-members/set`
+
+Body:
+
+```json
+{
+  "group": "CN=IT,OU=Groups,DC=example,DC=local",
+  "members": [
+    "CN=John Doe,OU=Infra,DC=example,DC=local"
+  ]
+}
+```
+
+### `GET /explorer/object?dn=`
+
+- Returns object details.
+
+### `GET /explorer/children?dn=...`
+
+- Returns direct children of an object.
 
 ## User administration
 
 ### `POST /admin/createUser`
-
-Request body:
-
-```json
-{
-  "OuDn": "OU=Users,DC=example,DC=local",
-  "Cn": "John Doe",
-  "Sam": "jdoe",
-  "GivenName": "John",
-  "Sn": "Doe",
-  "UserPrincipalName": "jdoe@example.local",
-  "Mail": "john.doe@example.local",
-  "Password": "InitialPassword",
-  "Enabled": true,
-  "Description": "Intranet account",
-  "ExpiresAt": "2026-12-31T23:59:59Z",
-  "NeverExpires": false
-}
-```
-
-Success:
-
-```json
-{
-  "success": true,
-  "dn": "CN=John Doe,OU=Users,DC=example,DC=local"
-}
-```
-
-### `POST /admin/deleteUser`
-
-Request body:
-
-```json
-{
-  "user": "jdoe"
-}
-```
-
 ### `POST /admin/updateUser`
-
-Request body:
-
-```json
-{
-  "user": "jdoe",
-  "attributes": {
-    "mail": "john.doe@example.local",
-    "telephoneNumber": "0102030405",
-    "description": "Admin account"
-  }
-}
-```
-
-Notes:
-
-- an empty value removes the attribute
-- `description` is limited to 1024 characters
-
+### `POST /admin/deleteUser`
 ### `POST /admin/moveUser`
-
-Request body:
-
-```json
-{
-  "user": "jdoe",
-  "newOuDn": "OU=Support,DC=example,DC=local"
-}
-```
-
 ### `POST /admin/renameUserCn`
-
-Request body:
-
-```json
-{
-  "user": "jdoe",
-  "newCn": "John Doe"
-}
-```
-
-### `POST /admin/setAccountExpiration`
-
-Request body:
-
-```json
-{
-  "user": "jdoe",
-  "expiresAt": "2026-12-31T23:59:59Z",
-  "never": false
-}
-```
-
-Or to clear expiration:
-
-```json
-{
-  "user": "jdoe",
-  "never": true
-}
-```
-
 ### `POST /admin/changePassword`
-
-Request body:
-
-```json
-{
-  "username": "jdoe",
-  "newPassword": "NewPassword",
-  "mustChangeAtNextLogon": true
-}
-```
-
+### `POST /admin/setAccountExpiration`
 ### `POST /admin/setUserEnabled`
-
-Request body:
-
-```json
-{
-  "user": "jdoe",
-  "enabled": true
-}
-```
-
 ### `POST /admin/enableUser`
-
-Human‑readable alias of `setUserEnabled` to enable an account.
-
 ### `POST /admin/disableUser`
-
-Human‑readable alias of `setUserEnabled` to disable an account.
-
 ### `POST /admin/unlockUser`
 
-Request body:
-
-```json
-{
-  "user": "jdoe"
-}
-```
-
-Typical status codes for user admin endpoints:
-
-- `200` – operation successful
-- `400` – invalid body or LDAP business error
-- `404` – user or target not found
-- `500` – server error
+All use explicit JSON payloads (`user`, `dn`, `attributes`, etc.), depending on the action.
 
 ## Group administration
 
 ### `POST /admin/createGroup`
-
-Request body:
-
-```json
-{
-  "OuDn": "OU=Groups,DC=example,DC=local",
-  "Cn": "Support Team",
-  "Sam": "SupportTeam",
-  "Scope": "Global",
-  "SecurityEnabled": true,
-  "Description": "Support group"
-}
-```
-
-### `POST /admin/addToGroup`
-
-Request body:
-
-```json
-{
-  "user": "jdoe",
-  "groupDn": "SupportTeam"
-}
-```
-
-### `POST /admin/removeFromGroup`
-
-Request body:
-
-```json
-{
-  "user": "jdoe",
-  "groupDn": "SupportTeam"
-}
-```
-
 ### `DELETE /admin/deleteGroup`
+### `POST /admin/deleteGroup` (alias)
 
-Or `POST /admin/deleteGroup` with a JSON body.
-
-Request body accepts one of:
-
-```json
-{
-  "dn": "CN=Support Team,OU=Groups,DC=example,DC=local"
-}
-```
-
-or:
-
-```json
-{
-  "group": "SupportTeam"
-}
-```
-
-Typical status codes:
-
-- `200` – operation successful
-- `400` – invalid parameter or LDAP error
-- `404` – group not found
-- `500` – server error
+`deleteGroup` accepts either `dn` or `group` in body.
 
 ## OU administration
 
 ### `POST /admin/ou/create`
-
-Request body:
-
-```json
-{
-  "ParentDn": "OU=Users,DC=example,DC=local",
-  "Name": "Contractors",
-  "Description": "Contractor OU",
-  "Protected": true
-}
-```
-
-When `Protected=true`, the API tags the OU with `adminDescription="API_PROTECTED=1"`.
-
 ### `POST /admin/ou/update`
-
-Request body:
-
-```json
-{
-  "OuDn": "OU=Contractors,OU=Users,DC=example,DC=local",
-  "NewName": "External Contractors",
-  "Description": "Renamed OU",
-  "Protected": true,
-  "NewParentDn": "OU=HR,DC=example,DC=local"
-}
-```
-
-Notes:
-
-- `Description = null` leaves the field unchanged
-- `Description = ""` removes the description
-- `NewParentDn` must remain under `BaseDn`
-
 ### `POST /admin/ou/delete`
 
-Request body:
+Key rules:
 
-```json
-{
-  "OuDn": "OU=Contractors,OU=Users,DC=example,DC=local"
-}
-```
+- scope limited to `BaseDn`,
+- OU protection rules enforced,
+- non-empty OUs cannot be deleted.
 
-Conditions:
+## Removed legacy endpoints
 
-- OU must be under `BaseDn`
-- OU must be empty
-- OU must not be protected
+These are no longer part of the active contract:
 
-Typical status codes:
+- `/admin/addToGroup`
+- `/admin/removeFromGroup`
+- `/explorer/groupMembers`
 
-- `200` – deletion successful
-- `403` – OU outside scope or protected
-- `404` – OU not found
-- `409` – OU not empty
-- `500` – server error
+## Common HTTP status codes
 
-## Common error codes
-
-- `400` – validation or invalid LDAP operation
-- `401` – user authentication failure
-- `403` – IP not allowed, missing internal secret, or forbidden operation
-- `404` – resource not found
-- `409` – conflict, for example non‑empty OU
-- `500` – server or LDAP bind error
-
+- `200`: success,
+- `400`: invalid payload / LDAP constraint,
+- `401`: authentication failure,
+- `403`: forbidden (IP, secret, context, scope),
+- `404`: resource not found,
+- `409`: conflict (for example non-empty OU),
+- `500`: server/LDAP bind error.
