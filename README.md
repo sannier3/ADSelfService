@@ -3,14 +3,26 @@
 **__Readme Languages__** [![Français](https://img.shields.io/badge/lang-Français-blue.svg)](README.md) [![English](https://img.shields.io/badge/lang-English-lightgrey.svg)](README.en.md) ![License](https://img.shields.io/badge/License-MIT-success?style=flat-square)
 
 `ADSelfService` est une solution intranet open source pour Active Directory.
-Elle fournit un parcours utilisateur simple, une administration centralisée pour l'IT, et un cadre de sécurité strict côté API et côté client web.
+Le dépôt regroupe une API .NET 8 et un client web PHP pensés pour fonctionner ensemble, avec une séparation claire entre logique AD, sécurité d'accès et interface intranet.
 
 ## Vue d'ensemble
 
-Le projet contient deux composants principaux :
+Les deux composants principaux sont :
 
-- `ADSelfService-API.Server` : API .NET 8 pour authentifier et administrer Active Directory.
-- `WEB-CLIENT-PHP` : client intranet PHP pour les parcours utilisateur et administrateur.
+- `ADSelfService-API.Server` : API .NET 8 pour l'authentification, les opérations LDAP/AD et les contrôles de sécurité serveur.
+- `WEB-CLIENT-PHP` : portail intranet PHP pour les parcours utilisateur, l'administration, l'i18n et les flux web.
+
+## Arborescence utile
+
+```text
+ADSelfService-API/
+|- ADSelfService-API.Server/   API .NET 8
+|- WEB-CLIENT-PHP/            client intranet PHP
+|- CONFIG-OPTIONS.md          référence config API (FR)
+|- CONFIG-OPTIONS.en.md       référence config API (EN)
+|- README.md                  vue d'ensemble FR
+`- README.en.md               vue d'ensemble EN
+```
 
 ## Fonctionnalités principales
 
@@ -24,17 +36,17 @@ Le projet contient deux composants principaux :
 - Explorateur AD et recherche d'objets.
 - Accès aux outils filtré selon les droits utilisateur.
 
-## Sécurité obligatoire
+## Baseline sécurité
 
 Le comportement actuel du code impose :
 
-- Filtrage des appels via `Security.AllowedIps`.
-- Clé partagée interne obligatoire et robuste : `Security.InternalSharedSecret`.
-- En-tête de contexte applicatif requis sur les routes sensibles : `X-App-Context`.
-- Transport LDAP protégé obligatoire :
+- filtrage des appels via `Security.AllowedIps`
+- clé partagée interne obligatoire et robuste : `Security.InternalSharedSecret`
+- en-tête de contexte applicatif requis sur les routes sensibles : `X-App-Context`
+- transport LDAP protégé obligatoire :
   - `Ldap.Ssl=true` (LDAPS), ou
-  - `Ldap.UseKerberosSealing=true` (LDAP + Kerberos sealing).
-- `Debug.ShowPasswords=true` interdit.
+  - `Ldap.UseKerberosSealing=true` (LDAP + Kerberos sealing)
+- `Debug.ShowPasswords=true` interdit
 
 Si ces contraintes ne sont pas respectées, l'API peut refuser de démarrer ou rejeter les appels.
 
@@ -46,9 +58,9 @@ Si ces contraintes ne sont pas respectées, l'API peut refuser de démarrer ou r
 
 Le client PHP filtre l'interface selon le rôle, et l'API applique aussi les contrôles côté serveur.
 
-## Installation rapide
+## Démarrage rapide
 
-### Option 1 — Depuis une release (recommandé)
+### Option 1 — Depuis une release
 
 1. Télécharger les archives depuis [GitHub Releases](https://github.com/sannier3/ADSelfService/releases).
 2. Déployer `ADSelfService-API-Server.zip` sur l'hôte API.
@@ -59,7 +71,7 @@ Le client PHP filtre l'interface selon le rôle, et l'API applique aussi les con
 7. Créer `WEB-CLIENT-PHP/config-intranet.php` depuis `config-intranet-default.php`.
 8. Vérifier la cohérence entre `API_BASE` et `INTERNAL_SHARED_SECRET`.
 
-### Option 2 — Construire depuis le code source
+### Option 2 — Depuis les sources
 
 ```bash
 git clone <url-du-repo>
@@ -69,14 +81,22 @@ cd ADSelfService-API.Server
 dotnet run
 ```
 
-## Conseils production
+## Documentation par composant
 
-- Ne pas exposer directement l'API sur Internet public.
-- Garder `AllowedIps` au plus strict.
-- Utiliser un secret long, unique et non réutilisé.
-- Préférer LDAPS en production.
-- Activer le debug uniquement pour diagnostic ponctuel.
-- Ne jamais versionner les fichiers de configuration sensibles.
+### API .NET
+
+- [ADSelfService-API.Server/README.md](ADSelfService-API.Server/README.md)
+- [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md)
+- [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md)
+- [ADSelfService-API.Server/ENDPOINTS.md](ADSelfService-API.Server/ENDPOINTS.md)
+- [ADSelfService-API.Server/CHANGELOG.md](ADSelfService-API.Server/CHANGELOG.md)
+
+### Client PHP
+
+- [WEB-CLIENT-PHP/README.md](WEB-CLIENT-PHP/README.md)
+- `WEB-CLIENT-PHP/config-intranet-default.php`
+- `WEB-CLIENT-PHP/intranet-i18n.php`
+- `WEB-CLIENT-PHP/forgot_password.php`
 
 ## Vérifications après déploiement
 
@@ -97,20 +117,3 @@ dotnet run
 | Échec LDAP bind | `Ldap.Url`, `Port`, `BindDn`, `BindPassword`, DNS/réseau |
 | Changement de mot de passe refusé | vérifier LDAPS ou Kerberos sealing |
 | Client PHP bloqué | `config-intranet.php`, `API_BASE`, secret partagé |
-
-## Endpoints clés
-
-- `GET /health` : état API + bind LDAP.
-- `POST /auth` : authentification AD.
-- `POST /user/changePassword` : changement de mot de passe utilisateur.
-- `POST /user/updateProfile` : mise à jour du profil utilisateur.
-- `GET /tree` : arborescence AD.
-- `GET /users`, `GET /groups` : vues de base.
-- `POST /admin/*` et `GET/POST /explorer/*` : administration avancée selon le rôle et le contexte.
-
-## Documentation associée
-
-- [CONFIG-OPTIONS.md](CONFIG-OPTIONS.md)
-- [ADSelfService-API.Server/LDAP-CONFIG.md](ADSelfService-API.Server/LDAP-CONFIG.md)
-- [ADSelfService-API.Server/ENDPOINTS.md](ADSelfService-API.Server/ENDPOINTS.md)
-- [ADSelfService-API.Server/CHANGELOG.md](ADSelfService-API.Server/CHANGELOG.md)

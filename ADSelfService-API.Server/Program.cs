@@ -1,6 +1,8 @@
 using Serilog;
 using Serilog.Events;
 using System;
+using System.Globalization;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Diagnostics;
 using System.DirectoryServices.Protocols;
@@ -36,25 +38,25 @@ public class Program
 
     public class LdapConfig
     {
-        public string Url { get; set; } = "dc01.example.local"; // IMPORTANT : Pour Kerberos, mettez le FQDN, pas l'IP !
-        public int Port { get; set; } = 389; // 389 pour Kerberos, 636 pour LDAPS
+        public string Url { get; set; } = "dc01.example.local"; // IMPORTANT: For Kerberos, use the FQDN, not the IP!
+        public int Port { get; set; } = 389; // 389 for Kerberos, 636 for LDAPS
         public bool Ssl { get; set; } = false;
 
-        // NOUVEAU : Active le "Sign & Seal" pour simuler une connexion sécurisée sur le port 389
+        // Enables "Sign & Seal" to simulate a secure connection on port 389
         public bool UseKerberosSealing { get; set; } = true;
 
         public bool IgnoreCertificate { get; set; } = true;
 
-        // IMPORTANT : Pour Kerberos, BindDn doit être "user@domain" ou "DOMAIN\User"
-        // Si vous mettez un DN complet (CN=...), Kerberos risque d'échouer.
+        // IMPORTANT: For Kerberos, BindDn must be "user@domain" or "DOMAIN\User"
+        // If you use a full DN (CN=...), Kerberos may fail.
         public string BindDn { get; set; } = "administrateur@example.local";
         public string BindPassword { get; set; } = "ChangeMe!";
 
-        // Base DN par défaut pour les UTILISATEURS
+        // Default base DN for USERS
         public string BaseDn { get; set; } = "OU=Infra,DC=example,DC=local";
-        // Base DN dédiée pour les GROUPES
+        // Dedicated base DN for GROUPS
         public string GroupBaseDn { get; set; } = "CN=Users,DC=example,DC=local";
-        // Racine (utile pour certains scénarios)
+        // Root (useful in some scenarios)
         public string RootDn { get; set; } = "DC=example,DC=local";
         public string AdminGroupDn { get; set; } = "CN=ADSyncAdmins,CN=Users,DC=example,DC=local";
     }
@@ -125,7 +127,11 @@ public class Program
         bool Enabled = true,
         string? Description = null,
         DateTimeOffset? ExpiresAt = null,   // ISO 8601 (ex: "2025-12-31T23:59:59Z")
-        bool NeverExpires = false
+        bool NeverExpires = false,
+        /// <summary>Source user sAM (cloning) — used to recompute UPN when needed.</summary>
+        string? CloneSourceSam = null,
+        /// <summary>UPN de l’utilisateur source (clonage).</summary>
+        string? CloneSourceUserPrincipalName = null
     );
 
     public record SetUserGroupsRequest(string User, List<string> Groups);
@@ -158,25 +164,28 @@ public class Program
         bool? Never                  // true => jamais, false => applique ExpiresAt
     );
 
+    /// <summary>User (sAM or DN) and target group (sAM, CN, or DN) to set the AD primary group.</summary>
+    public record SetUserPrimaryGroupRequest(string User, string Group);
+
     // === OU MODELS ===
     public record CreateOuRequest(
-        string ParentDn,              // DN parent (doit être sous baseDn)
+        string ParentDn,              // Parent DN (must be under baseDn)
         string Name,                  // nom de l'OU (RDN)
         string? Description = null,
-        bool? Protected = null        // si true => on protège (logiquement)
+        bool? Protected = null        // if true => mark protected (logical flag)
     );
 
     public sealed class UpdateOuRequest
     {
         public string OuDn { get; set; } = "";
-        public string? NewName { get; set; }          // facultatif
-        public string? Description { get; set; }      // null = ne pas toucher; "" = supprimer
-        public bool? Protected { get; set; }          // facultatif
-        public string? NewParentDn { get; set; }      // facultatif
+        public string? NewName { get; set; }          // optional
+        public string? Description { get; set; }      // null = leave unchanged; "" = remove
+        public bool? Protected { get; set; }          // optional
+        public string? NewParentDn { get; set; }      // optional
     }
 
     public record DeleteOuRequest(
-        string OuDn                   // DN à supprimer (doit être vide & non protégé)
+        string OuDn                   // OU DN to delete (must be empty and not protected)
     );
 
     public record DeleteGroupRequest(string? Group, string? Dn);
@@ -225,7 +234,7 @@ public class Program
 
         int baseFlag = scope.Equals("DomainLocal", StringComparison.OrdinalIgnoreCase) ? DOMAIN_LOCAL_GROUP
                      : scope.Equals("Universal", StringComparison.OrdinalIgnoreCase) ? UNIVERSAL_GROUP
-                     : GLOBAL_GROUP; // défaut Global
+                     : GLOBAL_GROUP; // default: Global
 
         return security ? (baseFlag | SECURITY_ENABLED) : baseFlag;
     }
@@ -430,23 +439,23 @@ public class Program
             }
         }
 
-        // Echapper le leading space
+        // Escape leading spaces
         int i = 0;
         while (i < sb.Length && sb[i] == ' ')
         {
             sb.Insert(i, '\\');
-            i += 2; // sauter "\ "
+            i += 2; // skip "\ "
         }
 
-        // Echapper les trailing spaces
+        // Escape trailing spaces
         int j = sb.Length - 1;
         while (j >= 0 && sb[j] == ' ')
         {
-            sb.Insert(j, '\\'); // insérer le backslash AVANT l'espace
+            sb.Insert(j, '\\'); // insert backslash BEFORE the space
             j -= 1;
         }
 
-        // Per RFC4514 : '#' seulement s'il est en tête
+        // Per RFC4514: '#' only when at start of value
         if (sb.Length > 0 && sb[0] == '#')
             sb.Insert(0, '\\');
 
@@ -455,13 +464,13 @@ public class Program
 
     static LdapConnection GetLdapConnection(AppConfig cfg)
     {
-        // Pour Kerberos, il est CRITIQUE d'utiliser le nom DNS (FQDN) et non l'IP.
-        // Kerberos utilise le SPN (Service Principal Name) qui est basé sur le nom de la machine.
+        // For Kerberos, using the DNS name (FQDN) instead of the IP is critical.
+        // Kerberos uses the SPN (Service Principal Name) derived from the machine name.
         var identifier = new LdapDirectoryIdentifier(cfg.Ldap.Url, cfg.Ldap.Port);
 
-        // Création des crédentials
-        // Note : Si BindDn est un DN complet (CN=...), cela force souvent le NTLM ou Basic.
-        // Pour Kerberos pur, préférez le format UPN (user@domaine.local) ou Down-Level (DOMAINE\User).
+        // Build credentials
+        // Note: if BindDn is a full DN (CN=...), it often forces NTLM or Basic.
+        // For pure Kerberos, prefer UPN (user@domain.local) or Down-Level (DOMAIN\User).
         var credentials = new NetworkCredential(cfg.Ldap.BindDn, cfg.Ldap.BindPassword);
 
         var connection = new LdapConnection(identifier, credentials);
@@ -471,10 +480,10 @@ public class Program
 
         if (cfg.Ldap.Ssl)
         {
-            // CAS 1 : LDAPS (SSL sur port 636)
+            // Case 1: LDAPS (SSL on port 636)
             connection.SessionOptions.SecureSocketLayer = true;
 
-            // En SSL, on peut utiliser Negotiate (recommandé) ou Basic.
+            // With SSL, Negotiate (recommended) or Basic may be used.
             connection.AuthType = AuthType.Negotiate;
 
             if (cfg.Ldap.IgnoreCertificate)
@@ -484,20 +493,20 @@ public class Program
         }
         else if (cfg.Ldap.UseKerberosSealing)
         {
-            // CAS 2 : LDAP + Kerberos (Simuler la sécurité sur port 389)
+            // Case 2: LDAP + Kerberos (secure channel simulation on port 389)
             connection.SessionOptions.SecureSocketLayer = false;
 
-            // C'est ici qu'on "simule" la jonction sécurisée
+            // Here we "simulate" the secure bind path
             connection.AuthType = AuthType.Negotiate; // Force Kerberos/GSSAPI
 
-            // Active le chiffrement (Seal) et la signature (Sign) des paquets
-            // AD acceptera les changements de mot de passe grâce à cela.
+            // Enable packet encryption (Seal) and signing (Sign)
+            // AD will accept password changes when these are enabled.
             connection.SessionOptions.Sealing = true;
             connection.SessionOptions.Signing = true;
         }
         else
         {
-            // CAS 3 : LDAP Standard (Peu sécurisé, modification mot de passe impossible)
+            // Case 3: plain LDAP (less secure; password changes not supported)
             connection.AuthType = AuthType.Basic;
             connection.SessionOptions.SecureSocketLayer = false;
         }
@@ -512,14 +521,14 @@ public class Program
             Log.Debug("[BindServiceAccount] Tentative de bind sur {Host}:{Port} (SSL={Ssl}, Seal={Seal})",
                 cfg.Ldap.Url, cfg.Ldap.Port, cfg.Ldap.Ssl, cfg.Ldap.UseKerberosSealing);
 
-            // En mode Negotiate/Kerberos, Bind() sans arguments utilise les NetworkCredential du constructeur
+            // In Negotiate/Kerberos mode, Bind() with no args uses the constructor NetworkCredential
             if (connection.AuthType == AuthType.Negotiate)
             {
                 connection.Bind();
             }
             else
             {
-                // En mode Basic (ou fallback), on repasse les credentials
+                // In Basic (or fallback) mode, pass credentials explicitly
                 connection.Bind(new NetworkCredential(cfg.Ldap.BindDn, cfg.Ldap.BindPassword));
             }
 
@@ -548,7 +557,7 @@ public class Program
             if (!BindServiceAccount(connection, cfg)) return null;
 
             string safeSam = EscapeLdapFilterValue(sam);
-            // Personnes uniquement (pas d'ordinateurs). On N'EXCLUT PAS les désactivés.
+            // People only (not computers). Disabled accounts are NOT excluded.
             string filter = $"(&(&(objectCategory=person)(objectClass=user))(sAMAccountName={safeSam}))";
 
             var request = new SearchRequest(
@@ -731,7 +740,7 @@ public class Program
         if (path.StartsWith("/user/") || path.StartsWith("/users"))
             return appCtx is "self-service" or "admin-user" or "admin-domain";
 
-        // Par défaut on refuse explicitement les appels sans contexte connu.
+        // By default, reject calls without a known application context.
         return false;
     }
 
@@ -776,7 +785,7 @@ public class Program
                 case null:
                     break;
                 case byte[] bytes:
-                    // Les valeurs devraient être des DN en texte. On tente UTF-8 puis UTF-16, sinon on garde en base64.
+                    // Values should be text DNs; try UTF-8 then UTF-16, else keep as base64.
                     try
                     {
                         res.Add(Encoding.UTF8.GetString(bytes));
@@ -818,7 +827,7 @@ public class Program
             memberOfDns.Any(dn => dn.Equals(adminDn, StringComparison.OrdinalIgnoreCase)))
             return true;
 
-        // 2) match sur le CN (si AdminGroupDn commence par CN=)
+        // 2) match CN (when AdminGroupDn starts with CN=)
         var adminCn = adminDn.StartsWith("CN=", StringComparison.OrdinalIgnoreCase)
             ? adminDn.Split(',')[0].Substring(3)
             : adminDn;
@@ -863,11 +872,52 @@ public class Program
             ?? DnToCn(e.DistinguishedName) ?? e.DistinguishedName;
     }
 
+    /// <summary>
+    /// Reads <c>objectClass</c> via <c>DirectoryAttribute.GetValues(typeof(string))</c>: enumerating LDAP values
+    /// directly can omit classes and misclassify everything as "other".
+    /// </summary>
+    static HashSet<string> GetObjectClassNameSet(SearchResultEntry e)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var oc = e.Attributes["objectClass"];
+        if (oc is null) return set;
+        try
+        {
+            foreach (var v in oc.GetValues(typeof(string)).Cast<string>())
+            {
+                if (!string.IsNullOrWhiteSpace(v)) set.Add(v);
+            }
+        }
+        catch
+        {
+            for (int i = 0; i < oc.Count; i++)
+            {
+                var v = oc[i]?.ToString();
+                if (!string.IsNullOrWhiteSpace(v)) set.Add(v);
+            }
+        }
+        return set;
+    }
+
+    /// <summary>
+    /// Fallback when <c>objectClass</c> is incomplete (<c>objectCategory</c> is reliable on AD).
+    /// </summary>
+    static string? InferTypeFromObjectCategory(SearchResultEntry e)
+    {
+        var cat = e.Attributes["objectCategory"]?[0]?.ToString();
+        if (string.IsNullOrWhiteSpace(cat)) return null;
+        if (cat.Contains("Organizational-Unit", StringComparison.OrdinalIgnoreCase)) return "ou";
+        if (cat.Contains("Domain-DNS", StringComparison.OrdinalIgnoreCase)) return "domain";
+        if (cat.Contains("CN=Group,", StringComparison.OrdinalIgnoreCase)) return "group";
+        if (cat.Contains("CN=Computer,", StringComparison.OrdinalIgnoreCase)) return "computer";
+        if (cat.Contains("CN=Container,", StringComparison.OrdinalIgnoreCase)) return "container";
+        if (cat.Contains("Builtin-Domain", StringComparison.OrdinalIgnoreCase)) return "container";
+        return null;
+    }
+
     static string GetNodeTypeFromEntry(SearchResultEntry e)
     {
-        var oc = e.Attributes["objectClass"];
-        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (oc != null) foreach (var v in oc) set.Add(v?.ToString() ?? "");
+        var set = GetObjectClassNameSet(e);
 
         if (set.Contains("domainDNS")) return "domain";
         if (set.Contains("organizationalUnit")) return "ou";
@@ -875,21 +925,34 @@ public class Program
         if (set.Contains("group")) return "group";
         if (set.Contains("computer")) return "computer";
         if (set.Contains("inetOrgPerson")) return "inetOrgPerson";
+
+        var inferred = InferTypeFromObjectCategory(e);
+        // Computer account: "user" is often in objectClass; objectCategory distinguishes PC vs person.
+        if (string.Equals(inferred, "computer", StringComparison.OrdinalIgnoreCase)) return "computer";
         if (set.Contains("user")) return "user";
+        if (!string.IsNullOrWhiteSpace(inferred)) return inferred!;
+
         return "other";
     }
 
     static string[] GetObjectClassesFromEntry(SearchResultEntry e)
     {
         var oc = e.Attributes["objectClass"];
-        if (oc is null || oc.Count == 0) return Array.Empty<string>();
-        var list = new List<string>(oc.Count);
-        for (int i = 0; i < oc.Count; i++)
+        if (oc is null) return Array.Empty<string>();
+        try
         {
-            var v = oc[i]?.ToString();
-            if (!string.IsNullOrWhiteSpace(v)) list.Add(v);
+            return oc.GetValues(typeof(string)).Cast<string>().Where(s => !string.IsNullOrWhiteSpace(s)).ToArray();
         }
-        return list.ToArray();
+        catch
+        {
+            var list = new List<string>(oc.Count);
+            for (int i = 0; i < oc.Count; i++)
+            {
+                var v = oc[i]?.ToString();
+                if (!string.IsNullOrWhiteSpace(v)) list.Add(v);
+            }
+            return list.ToArray();
+        }
     }
 
     static bool NodeHasChildContainers(LdapConnection conn, string dn)
@@ -966,7 +1029,7 @@ public class Program
         return nodes;
     }
 
-    // Dit si la chaîne ressemble à un DN
+    // True if the string looks like a DN
     static bool LooksLikeDn(string? s)
     {
         if (string.IsNullOrWhiteSpace(s)) return false;
@@ -975,14 +1038,14 @@ public class Program
             || (s.Contains("CN=", StringComparison.OrdinalIgnoreCase) && s.Contains(","));
     }
 
-    // Base de recherche des groupes
+    // Group search base
     static string EffectiveExplorerBaseDn(AppConfig cfg)
         => string.IsNullOrWhiteSpace(cfg.Ldap.BaseDn) ? cfg.Ldap.RootDn : cfg.Ldap.BaseDn;
 
     static string EffectiveGroupBaseDn(AppConfig cfg) =>
         string.IsNullOrWhiteSpace(cfg.Ldap.GroupBaseDn) ? cfg.Ldap.RootDn : cfg.Ldap.GroupBaseDn;
 
-    // Résout un DN de groupe depuis CN / sAM / name
+    // Resolve group DN from CN / sAM / name
     static string? ResolveGroupDn(AppConfig cfg, LdapConnection connection, string input)
     {
         if (LooksLikeDn(input)) return input;
@@ -1011,12 +1074,23 @@ public class Program
         return resp.Entries.Count > 0 ? resp.Entries[0].DistinguishedName : null;
     }
 
-    static List<string> GetDirectUserGroupDns(LdapConnection connection, string userDn)
+    /// <summary>
+    /// DNs of groups the user is a <em>direct</em> member of, including the primary group
+    /// (e.g. "Domain Users"), which is missing from LDAP <c>memberOf</c>.
+    /// </summary>
+    static List<string> GetDirectUserGroupDns(AppConfig cfg, LdapConnection connection, string userDn)
     {
-        if (!TryGetEntry(connection, userDn, out var userEntry, new[] { "memberOf" }) || userEntry is null)
+        if (!TryGetEntry(connection, userDn, out var userEntry, new[] { "memberOf", "primaryGroupID", "objectSid" }) || userEntry is null)
             return new List<string>();
-        return userEntry.Attributes["memberOf"]?.GetValues(typeof(string)).Cast<string>().Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
-               ?? new List<string>();
+        var list = userEntry.Attributes["memberOf"]?.GetValues(typeof(string)).Cast<string>()
+            .Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+            ?? new List<string>();
+        string? primaryDn = null;
+        try { primaryDn = GetPrimaryGroupDn(cfg, connection, userEntry); }
+        catch { /* ignore */ }
+        if (!string.IsNullOrWhiteSpace(primaryDn) && !list.Exists(d => d.Equals(primaryDn, StringComparison.OrdinalIgnoreCase)))
+            list.Insert(0, primaryDn);
+        return list;
     }
 
     static List<string> GetDirectGroupMemberDns(LdapConnection connection, string groupDn)
@@ -1054,12 +1128,12 @@ public class Program
         };
     }
 
-    // Récupère tous les groupes (DN) en suivant l’imbrication grâce au matching rule IN_CHAIN
+    // All group DNs for the user via transitive membership (matching rule IN_CHAIN)
     static List<string> GetTransitiveGroupDnsForUser(AppConfig cfg, LdapConnection conn, string userDn)
     {
         string baseDn = EffectiveGroupBaseDn(cfg);
         string safeUserDn = EscapeLdapFilterValue(userDn);
-        // Trouve tous les groupes dont le membre (direct ou imbriqué) contient l’utilisateur
+        // Groups whose member (direct or nested) includes this user
         string filter = $"(member:1.2.840.113556.1.4.1941:={safeUserDn})";
 
         var req = new SearchRequest(
@@ -1076,23 +1150,169 @@ public class Program
                   .ToList();
     }
 
-    // Récupère le DN du groupe primaire en reconstruisant le SID du groupe : domainSid + primaryGroupID
+    /// <summary>
+    /// Under System.DirectoryServices.Protocols, <c>primaryGroupID</c> is often a byte array;
+    /// <c>[0].ToString()</c> does not yield a parseable integer.
+    /// </summary>
+    static bool TryReadPrimaryGroupRid(SearchResultEntry entry, out int rid)
+    {
+        rid = 0;
+        var a = entry.Attributes["primaryGroupID"];
+        if (a is null || a.Count == 0) return false;
+        var v = a[0];
+        switch (v)
+        {
+            case int i:
+                rid = i;
+                return true;
+            case long lng:
+                rid = checked((int)lng);
+                return true;
+            case uint ui:
+                rid = checked((int)ui);
+                return true;
+            case byte[] bytes:
+                if (bytes.Length == 0) return false;
+                if (bytes.Length >= 4)
+                {
+                    rid = BitConverter.ToInt32(bytes, 0);
+                    return true;
+                }
+                for (var k = 0; k < bytes.Length; k++)
+                    rid |= (bytes[k] & 0xFF) << (8 * k);
+                return true;
+            default:
+                var s = v?.ToString();
+                if (string.IsNullOrWhiteSpace(s)) return false;
+                if (s.StartsWith("System.", StringComparison.Ordinal)) return false;
+                return int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out rid);
+        }
+    }
+
+    /// <summary>Reads a numeric LDAP attribute often returned as int, long, or byte array (e.g. systemFlags).</summary>
+    static bool TryParseDirectoryNumeric(object? raw, out int value)
+    {
+        value = 0;
+        if (raw is null) return false;
+        switch (raw)
+        {
+            case int i:
+                value = i;
+                return true;
+            case long lng:
+                value = checked((int)lng);
+                return true;
+            case uint ui:
+                value = checked((int)ui);
+                return true;
+            case byte[] bytes:
+                if (bytes.Length >= 4)
+                {
+                    value = BitConverter.ToInt32(bytes, 0);
+                    return true;
+                }
+                for (var k = 0; k < bytes.Length; k++)
+                    value |= (bytes[k] & 0xFF) << (8 * k);
+                return bytes.Length > 0;
+            default:
+                var s = raw.ToString();
+                if (string.IsNullOrWhiteSpace(s) || s.StartsWith("System.", StringComparison.Ordinal))
+                    return false;
+                return int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+        }
+    }
+
+    /// <summary>LDAP systemFlags: string may exceed int.MaxValue (e.g. 2147483648); high-bit masks as uint.</summary>
+    static bool TryParseDirectoryFlags(object? raw, out long value)
+    {
+        value = 0;
+        if (raw is null) return false;
+        switch (raw)
+        {
+            case int i:
+                value = i;
+                return true;
+            case long lng:
+                value = lng;
+                return true;
+            case uint ui:
+                value = ui;
+                return true;
+            case byte[] bytes:
+                if (bytes.Length >= 4)
+                {
+                    value = BitConverter.ToUInt32(bytes, 0);
+                    return true;
+                }
+                for (var k = 0; k < bytes.Length; k++)
+                    value |= (long)(bytes[k] & 0xFF) << (8 * k);
+                return bytes.Length > 0;
+            default:
+                var s = raw.ToString();
+                if (string.IsNullOrWhiteSpace(s) || s.StartsWith("System.", StringComparison.Ordinal))
+                    return false;
+                return long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+        }
+    }
+
+    static byte[]? ReadObjectSidBytes(SearchResultEntry entry)
+    {
+        var a = entry.Attributes["objectSid"];
+        if (a is null || a.Count == 0) return null;
+        return a[0] as byte[];
+    }
+
+    static bool TryGetRidFromObjectSidBytes(byte[]? sidBytes, out int rid)
+    {
+        rid = 0;
+        if (sidBytes is null || sidBytes.Length == 0) return false;
+        try
+        {
+            var sid = new SecurityIdentifier(sidBytes, 0);
+            var parts = sid.Value.Split('-', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) return false;
+            return int.TryParse(parts[^1], NumberStyles.Integer, CultureInfo.InvariantCulture, out rid);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>True if at least one user or computer in the domain has this RID as primary group.</summary>
+    static bool AnyUserOrComputerUsesPrimaryGroupRid(LdapConnection conn, string searchBaseDn, int rid)
+    {
+        if (string.IsNullOrWhiteSpace(searchBaseDn) || rid <= 0) return false;
+        var filter = $"(&(|(objectClass=user)(objectClass=computer))(primaryGroupID={rid}))";
+        var req = new SearchRequest(searchBaseDn, filter, SearchScope.Subtree, "distinguishedName");
+        req.SizeLimit = 1;
+        try
+        {
+            var resp = (SearchResponse)conn.SendRequest(req);
+            return resp.Entries.Count > 0;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[PrimaryGroupRid] Search primaryGroupID={Rid} under {Base} failed.", rid, searchBaseDn);
+            return false;
+        }
+    }
+
+    // Primary group DN by reconstructing group SID: domainSid + primaryGroupID
     static string? GetPrimaryGroupDn(AppConfig cfg, LdapConnection conn, SearchResultEntry userEntry)
     {
-        // Besoin de objectSid + primaryGroupID sur l’entrée utilisateur (pense à les demander dans les attributs des recherches)
-        var objSidBytes = userEntry.Attributes["objectSid"]?[0] as byte[];
-        var pgidStr = userEntry.Attributes["primaryGroupID"]?[0]?.ToString();
-        if (objSidBytes == null || string.IsNullOrWhiteSpace(pgidStr)) return null;
-        if (!int.TryParse(pgidStr, out var pgid)) return null;
+        if (!TryReadPrimaryGroupRid(userEntry, out var pgid)) return null;
+        var objSidBytes = ReadObjectSidBytes(userEntry);
+        if (objSidBytes is null || objSidBytes.Length == 0) return null;
 
-        // Domain SID du compte, puis SID du groupe primaire = domainSid + "-" + primaryGroupID
+        // Account domain SID, then primary group SID = domainSid + "-" + primaryGroupID
         var userSid = new System.Security.Principal.SecurityIdentifier(objSidBytes, 0);
         var domainSid = userSid.AccountDomainSid;
         if (domainSid == null) return null;
 
         var groupSid = new System.Security.Principal.SecurityIdentifier(domainSid.Value + "-" + pgid);
 
-        // Recherche par objectSid (valeur binaire échappée)
+        // Lookup by objectSid (binary value escaped for filter)
         var groupSidBytes = new byte[groupSid.BinaryLength];
         groupSid.GetBinaryForm(groupSidBytes, 0);
         var sidHex = BytesToLdapHex(groupSidBytes);
@@ -1103,7 +1323,64 @@ public class Program
         return resp.Entries.Count > 0 ? resp.Entries[0].DistinguishedName : null;
     }
 
-    // Version "isAdmin" robuste : teste l’appartenance effective par DN (imbriqué + primaire inclus)
+    /// <summary>
+    /// Adds the user to group <paramref name="groupDn"/>; no-op if already a member (LDAP "already exists").
+    /// </summary>
+    static void EnsureUserIsGroupMember(LdapConnection connection, string groupDn, string userDn)
+    {
+        var addMod = new DirectoryAttributeModification { Operation = DirectoryAttributeOperation.Add, Name = "member" };
+        addMod.Add(userDn);
+        try
+        {
+            _ = (ModifyResponse)connection.SendRequest(new ModifyRequest(groupDn, addMod));
+        }
+        catch (DirectoryOperationException doe)
+        {
+            var rc = doe.Response?.ResultCode ?? ResultCode.Other;
+            // 20 = attributeOrValueExists, 68 = entryAlreadyExists (directory-dependent)
+            if (rc == (ResultCode)20 || rc == (ResultCode)68) return;
+            var em = (doe.Response?.ErrorMessage ?? doe.Message ?? "").ToLowerInvariant();
+            if (em.Contains("already exists") || em.Contains("attribute or value exists") || em.Contains("exists"))
+                return;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Sets primary group: same domain SID as user, add to group if needed, then <c>primaryGroupID</c> = group RID.
+    /// </summary>
+    static void SetUserPrimaryGroup(AppConfig cfg, LdapConnection connection, string userDn, string groupDn)
+    {
+        if (!TryGetEntry(connection, userDn, out var userEntry, new[] { "objectSid" }) || userEntry is null)
+            throw new InvalidOperationException("Utilisateur introuvable.");
+        if (!TryGetEntry(connection, groupDn, out var groupEntry, new[] { "objectSid" }) || groupEntry is null)
+            throw new InvalidOperationException("Groupe introuvable.");
+
+        var userSidBytes = userEntry.Attributes["objectSid"]?[0] as byte[];
+        var groupSidBytes = groupEntry.Attributes["objectSid"]?[0] as byte[];
+        if (userSidBytes == null || groupSidBytes == null)
+            throw new InvalidOperationException("SID manquant (utilisateur ou groupe).");
+
+        var userSid = new SecurityIdentifier(userSidBytes, 0);
+        var groupSid = new SecurityIdentifier(groupSidBytes, 0);
+        var userDomain = userSid.AccountDomainSid;
+        var groupDomain = groupSid.AccountDomainSid;
+        if (userDomain == null || groupDomain == null || !userDomain.Equals(groupDomain))
+            throw new InvalidOperationException("Le groupe principal doit être un groupe de sécurité du même domaine que l’utilisateur.");
+
+        var sidParts = groupSid.Value.Split('-');
+        if (sidParts.Length < 2 || !int.TryParse(sidParts[^1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var ridParsed))
+            throw new InvalidOperationException("Impossible de lire le RID du groupe (objectSid).");
+        int rid = ridParsed;
+
+        EnsureUserIsGroupMember(connection, groupDn, userDn);
+
+        var pgMod = new DirectoryAttributeModification { Operation = DirectoryAttributeOperation.Replace, Name = "primaryGroupID" };
+        pgMod.Add(rid.ToString(CultureInfo.InvariantCulture));
+        _ = (ModifyResponse)connection.SendRequest(new ModifyRequest(userDn, pgMod));
+    }
+
+    // Robust isAdmin: effective membership by DN (nested + primary included)
     static bool IsAdminEffective(HashSet<string> effectiveGroupDns, AppConfig cfg)
     {
         var adminDn = cfg.Ldap.AdminGroupDn ?? "";
@@ -1112,7 +1389,7 @@ public class Program
         // 1) DN exact
         if (effectiveGroupDns.Contains(adminDn, StringComparer.OrdinalIgnoreCase)) return true;
 
-        // 2) fallback CN si tu veux garder la tolérance
+        // 2) CN fallback for lenient matching
         var adminCn = adminDn.StartsWith("CN=", StringComparison.OrdinalIgnoreCase)
             ? adminDn.Split(',')[0].Substring(3)
             : adminDn;
@@ -1131,7 +1408,7 @@ public class Program
     // === HELPERS FILETIME / accountExpires ===
     static bool IsNeverAccountExpiresValue(string? v)
     {
-        // 0 ou 9223372036854775807 => "Jamais" en AD
+        // 0 or 9223372036854775807 => "Never" in AD
         return string.IsNullOrWhiteSpace(v) || v == "0" || v == "9223372036854775807";
     }
 
@@ -1150,6 +1427,17 @@ public class Program
             catch { /* ignore */ }
         }
         return (null, false);
+    }
+
+    /// <summary>pwdLastSet 0 => user must change password at next logon.</summary>
+    static bool PwdMustChangeAtNextLogon(SearchResultEntry entry)
+    {
+        var attr = entry.Attributes["pwdLastSet"];
+        if (attr is null || attr.Count == 0) return false;
+        var raw = attr[0];
+        if (raw is byte[] b && b.Length >= 8)
+            return BitConverter.ToInt64(b, 0) == 0L;
+        return long.TryParse(raw?.ToString(), out var ft) && ft == 0L;
     }
 
     static string ToAccountExpiresFileTime(DateTimeOffset dto)
@@ -1209,7 +1497,7 @@ public class Program
         };
         if (never) mod.Add("0");
         else if (when.HasValue) mod.Add(ToAccountExpiresFileTime(when.Value));
-        else mod.Add("0"); // fallback "jamais"
+        else mod.Add("0"); // fallback "never"
         return mod;
     }
 
@@ -1220,15 +1508,15 @@ public class Program
     {
         var c = child.Trim().Trim(',');
         var p = parent.Trim().Trim(',');
-        if (c.Equals(p, StringComparison.OrdinalIgnoreCase)) return true; // autoriser création directement sous BaseDn
+        if (c.Equals(p, StringComparison.OrdinalIgnoreCase)) return true; // allow creation directly under BaseDn
         return c.EndsWith("," + p, StringComparison.OrdinalIgnoreCase);
     }
 
     static bool TryGetEntry(LdapConnection conn, string dn, out SearchResultEntry? entry, string[]? attrs = null)
     {
         var req = new SearchRequest(
-            dn,                               // base DN ⇒ pas d’échappement à gérer
-            "(objectClass=*)",                // filtre passe-partout
+            dn,                               // base DN — no RDN escaping needed
+            "(objectClass=*)",                // catch-all filter
             SearchScope.Base,
             attrs ?? new[] { "objectClass", "objectCategory" }
         );
@@ -1254,36 +1542,296 @@ public class Program
               ?? Enumerable.Empty<string>();
 
         var oc = new HashSet<string>(get("objectClass").Select(s => s.ToLowerInvariant()));
-        if (oc.Contains("organizationalunit")) return true;  // OU classique
+        if (oc.Contains("organizationalunit")) return true;  // classic OU
         if (oc.Contains("container")) return true;           // CN=Users, etc.
-        if (oc.Contains("domaindns")) return true;           // racine du domaine
+        if (oc.Contains("domaindns")) return true;           // domain root
 
         var cat = get("objectCategory").FirstOrDefault() ?? "";
         if (cat.IndexOf("CN=Organizational-Unit", StringComparison.OrdinalIgnoreCase) >= 0) return true;
         if (cat.IndexOf("CN=Container", StringComparison.OrdinalIgnoreCase) >= 0) return true;
         if (cat.IndexOf("CN=Domain-DNS", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-        Log.Information("[OU/create] ParentDN rejeté. objectClass={@oc} objectCategory={cat}", oc.ToArray(), cat);
+        Log.Information("[OU/create] ParentDN rejected. objectClass={@oc} objectCategory={cat}", oc.ToArray(), cat);
 
         return false;
     }
 
-    // “Protection” logique via adminDescription (ta convention) + blocage système
-    static bool OuIsProtected(LdapConnection conn, string ouDn)
-    {
-        var req = new SearchRequest(ouDn, "(objectClass=organizationalUnit)", SearchScope.Base,
-            "adminDescription", "isCriticalSystemObject");
-        var resp = (SearchResponse)conn.SendRequest(req);
-        if (resp.Entries.Count != 1) return false;
-        var e = resp.Entries[0];
+    // "Protected": RSAT/ADUC-style DACL (DENY Everyone DELETE+DELETE_TREE on the OU, DENY DELETE_CHILD on parent),
+    // plus systemFlags, API marker adminDescription, isCriticalSystemObject.
+    const long SystemFlagDisallowDeleteLegacy = 0x02000000L;
+    const long SystemFlagDisallowDeleteAccidental = 0x80000000L;
 
-        // Ton marqueur
+    /// <summary>LDAP_SERVER_SD_FLAGS_OID: BER SEQUENCE { INTEGER } with DACL_SECURITY_INFORMATION (4).</summary>
+    static readonly byte[] LdapSdFlagsControlDaclOnly = { 0x30, 0x03, 0x02, 0x01, 0x04 };
+
+    /// <summary>OWNER + GROUP + DACL (1+2+4) to read/write a consistent security descriptor.</summary>
+    static readonly byte[] LdapSdFlagsControlOwnerGroupDacl = { 0x30, 0x03, 0x02, 0x01, 0x07 };
+
+    const uint AdAccessMaskDelete = 0x0001_0000;   // ActiveDirectoryRights.Delete
+    const uint AdAccessMaskDeleteTree = 0x0000_0040; // DeleteTree
+    const uint AdAccessMaskDeleteChild = 0x0000_0002; // DeleteChild (on parent)
+
+    static readonly SecurityIdentifier EveryoneSid = new(WellKnownSidType.WorldSid, null);
+
+    static bool IsAccessDeniedAce(GenericAce ace) =>
+        ace.AceType == AceType.AccessDenied || ace.AceType == AceType.AccessDeniedObject;
+
+    static bool TryGetNtSecurityDescriptorBytes(SearchResultEntry entry, out byte[]? sdBytes)
+    {
+        sdBytes = null;
+        var a = entry.Attributes["nTSecurityDescriptor"];
+        if (a is null || a.Count == 0) return false;
+        if (a[0] is byte[] b && b.Length > 0)
+        {
+            sdBytes = b;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// RSAT-style "protect from accidental deletion" on the OU: DENY Everyone DELETE and DELETE_TREE.
+    /// </summary>
+    static bool OuDaclHasEveryoneDenyDeleteAndDeleteTree(byte[] binarySd)
+    {
+        try
+        {
+            var sd = new RawSecurityDescriptor(binarySd, 0);
+            if (sd.DiscretionaryAcl is null) return false;
+            var hasDelete = false;
+            var hasDeleteTree = false;
+            foreach (GenericAce ace in sd.DiscretionaryAcl)
+            {
+                if (!IsAccessDeniedAce(ace)) continue;
+                if (ace is not QualifiedAce qa) continue;
+                if (!EveryoneSid.Equals(qa.SecurityIdentifier)) continue;
+                var m = unchecked((uint)qa.AccessMask);
+                if ((m & AdAccessMaskDelete) != 0) hasDelete = true;
+                if ((m & AdAccessMaskDeleteTree) != 0) hasDeleteTree = true;
+            }
+            return hasDelete && hasDeleteTree;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "OuDaclHasEveryoneDenyDeleteAndDeleteTree: parse SD");
+            return false;
+        }
+    }
+
+    /// <summary>On parent: DENY Everyone DELETE_CHILD (blocks deleting the child OU).</summary>
+    static bool ParentDaclHasEveryoneDenyDeleteChild(byte[] binarySd)
+    {
+        try
+        {
+            var sd = new RawSecurityDescriptor(binarySd, 0);
+            if (sd.DiscretionaryAcl is null) return false;
+            foreach (GenericAce ace in sd.DiscretionaryAcl)
+            {
+                if (!IsAccessDeniedAce(ace)) continue;
+                if (ace is not QualifiedAce qa) continue;
+                if (!EveryoneSid.Equals(qa.SecurityIdentifier)) continue;
+                if ((unchecked((uint)qa.AccessMask) & AdAccessMaskDeleteChild) != 0)
+                    return true;
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "ParentDaclHasEveryoneDenyDeleteChild: parse SD");
+            return false;
+        }
+    }
+
+    static bool TryFetchNtSecurityDescriptorDacl(LdapConnection conn, string dn, out byte[]? sdBytes)
+    {
+        sdBytes = null;
+        try
+        {
+            var req = new SearchRequest(dn, "(objectClass=*)", SearchScope.Base, "nTSecurityDescriptor");
+            req.Controls.Add(new DirectoryControl("1.2.840.113556.1.4.801", LdapSdFlagsControlDaclOnly, true, true));
+            var resp = (SearchResponse)conn.SendRequest(req);
+            if (resp.Entries.Count != 1) return false;
+            return TryGetNtSecurityDescriptorBytes(resp.Entries[0], out sdBytes) && sdBytes is not null;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "TryFetchNtSecurityDescriptorDacl failed for {Dn}", dn);
+            return false;
+        }
+    }
+
+    static bool TryReadNtSecurityDescriptorOgd(LdapConnection conn, string dn, out byte[]? sdBytes)
+    {
+        sdBytes = null;
+        try
+        {
+            var req = new SearchRequest(dn, "(objectClass=*)", SearchScope.Base, "nTSecurityDescriptor");
+            req.Controls.Add(new DirectoryControl("1.2.840.113556.1.4.801", LdapSdFlagsControlOwnerGroupDacl, true, true));
+            var resp = (SearchResponse)conn.SendRequest(req);
+            if (resp.Entries.Count != 1) return false;
+            return TryGetNtSecurityDescriptorBytes(resp.Entries[0], out sdBytes) && sdBytes is not null;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "TryReadNtSecurityDescriptorOgd failed for {Dn}", dn);
+            return false;
+        }
+    }
+
+    static void WriteNtSecurityDescriptorOgd(LdapConnection conn, string dn, byte[] newSd)
+    {
+        var mod = new DirectoryAttributeModification
+        {
+            Name = "nTSecurityDescriptor",
+            Operation = DirectoryAttributeOperation.Replace
+        };
+        mod.Add(newSd);
+        var mreq = new ModifyRequest(dn, mod);
+        mreq.Controls.Add(new DirectoryControl("1.2.840.113556.1.4.801", LdapSdFlagsControlOwnerGroupDacl, true, true));
+        _ = (ModifyResponse)conn.SendRequest(mreq);
+    }
+
+    static bool MatchesEveryoneDenyDeleteDeleteTreeOnly(System.DirectoryServices.ActiveDirectoryAccessRule r)
+    {
+        if (r.AccessControlType != AccessControlType.Deny) return false;
+        if (!EveryoneSid.Equals((SecurityIdentifier)r.IdentityReference)) return false;
+        if (r.InheritanceType != System.DirectoryServices.ActiveDirectorySecurityInheritance.None) return false;
+        const System.DirectoryServices.ActiveDirectoryRights rel =
+            System.DirectoryServices.ActiveDirectoryRights.Delete | System.DirectoryServices.ActiveDirectoryRights.DeleteTree;
+        if ((r.ActiveDirectoryRights & rel) == 0) return false;
+        return (r.ActiveDirectoryRights & ~rel) == 0;
+    }
+
+    static bool MatchesEveryoneDenyDeleteChildOnly(System.DirectoryServices.ActiveDirectoryAccessRule r)
+    {
+        if (r.AccessControlType != AccessControlType.Deny) return false;
+        if (!EveryoneSid.Equals((SecurityIdentifier)r.IdentityReference)) return false;
+        if (r.InheritanceType != System.DirectoryServices.ActiveDirectorySecurityInheritance.None) return false;
+        if (!r.ActiveDirectoryRights.HasFlag(System.DirectoryServices.ActiveDirectoryRights.DeleteChild)) return false;
+        return (r.ActiveDirectoryRights & ~System.DirectoryServices.ActiveDirectoryRights.DeleteChild) == 0;
+    }
+
+    static void RemoveEveryoneDenyDeleteDeleteTreeOnObject(System.DirectoryServices.ActiveDirectorySecurity ads)
+    {
+        var toRemove = ads.GetAccessRules(true, true, typeof(SecurityIdentifier))
+            .Cast<System.DirectoryServices.ActiveDirectoryAccessRule>()
+            .Where(MatchesEveryoneDenyDeleteDeleteTreeOnly)
+            .ToList();
+        foreach (var r in toRemove)
+            ads.RemoveAccessRule(r);
+    }
+
+    static void RemoveEveryoneDenyDeleteChildOnObject(System.DirectoryServices.ActiveDirectorySecurity ads)
+    {
+        var toRemove = ads.GetAccessRules(true, true, typeof(SecurityIdentifier))
+            .Cast<System.DirectoryServices.ActiveDirectoryAccessRule>()
+            .Where(MatchesEveryoneDenyDeleteChildOnly)
+            .ToList();
+        foreach (var r in toRemove)
+            ads.RemoveAccessRule(r);
+    }
+
+    /// <summary>
+    /// Enables/disables RSAT-style "accidental deletion" protection: DACL on OU and parent.
+    /// Does not rely on adminDescription (often absent on organizationalUnit in AD schema).
+    /// </summary>
+    static bool TrySetOuAccidentalDeletionProtection(LdapConnection conn, string ouDn, bool protect, out string? error)
+    {
+        error = null;
+        try
+        {
+            var parentDn = ParentDnOf(ouDn);
+
+            if (!protect)
+            {
+                if (!string.IsNullOrEmpty(parentDn)
+                    && TryReadNtSecurityDescriptorOgd(conn, parentDn, out var pBytesUn) && pBytesUn is not null)
+                {
+                    var pSec = new System.DirectoryServices.ActiveDirectorySecurity();
+                    pSec.SetSecurityDescriptorBinaryForm(pBytesUn, AccessControlSections.All);
+                    RemoveEveryoneDenyDeleteChildOnObject(pSec);
+                    WriteNtSecurityDescriptorOgd(conn, parentDn, pSec.GetSecurityDescriptorBinaryForm());
+                }
+
+                if (!TryReadNtSecurityDescriptorOgd(conn, ouDn, out var ouBytesUn) || ouBytesUn is null)
+                {
+                    error = "Impossible de lire nTSecurityDescriptor sur l’OU.";
+                    return false;
+                }
+                var ouSecUn = new System.DirectoryServices.ActiveDirectorySecurity();
+                ouSecUn.SetSecurityDescriptorBinaryForm(ouBytesUn, AccessControlSections.All);
+                RemoveEveryoneDenyDeleteDeleteTreeOnObject(ouSecUn);
+                WriteNtSecurityDescriptorOgd(conn, ouDn, ouSecUn.GetSecurityDescriptorBinaryForm());
+                return true;
+            }
+
+            if (!TryReadNtSecurityDescriptorOgd(conn, ouDn, out var ouBytes) || ouBytes is null)
+            {
+                error = "Impossible de lire nTSecurityDescriptor sur l’OU (droits « Contrôle total » / Write DACL requis).";
+                return false;
+            }
+            var ouSec = new System.DirectoryServices.ActiveDirectorySecurity();
+            ouSec.SetSecurityDescriptorBinaryForm(ouBytes, AccessControlSections.All);
+            if (!OuDaclHasEveryoneDenyDeleteAndDeleteTree(ouBytes))
+            {
+                ouSec.AddAccessRule(new System.DirectoryServices.ActiveDirectoryAccessRule(
+                    EveryoneSid,
+                    System.DirectoryServices.ActiveDirectoryRights.Delete | System.DirectoryServices.ActiveDirectoryRights.DeleteTree,
+                    AccessControlType.Deny,
+                    System.DirectoryServices.ActiveDirectorySecurityInheritance.None));
+            }
+            WriteNtSecurityDescriptorOgd(conn, ouDn, ouSec.GetSecurityDescriptorBinaryForm());
+
+            if (string.IsNullOrEmpty(parentDn))
+                return true;
+
+            if (!TryReadNtSecurityDescriptorOgd(conn, parentDn, out var pBytes) || pBytes is null)
+            {
+                error = "OU partiellement protégée : lecture nTSecurityDescriptor du parent impossible. Réessayez avec un compte ayant les droits sur le parent.";
+                return false;
+            }
+            var pSecProt = new System.DirectoryServices.ActiveDirectorySecurity();
+            pSecProt.SetSecurityDescriptorBinaryForm(pBytes, AccessControlSections.All);
+            if (!ParentDaclHasEveryoneDenyDeleteChild(pBytes))
+            {
+                pSecProt.AddAccessRule(new System.DirectoryServices.ActiveDirectoryAccessRule(
+                    EveryoneSid,
+                    System.DirectoryServices.ActiveDirectoryRights.DeleteChild,
+                    AccessControlType.Deny,
+                    System.DirectoryServices.ActiveDirectorySecurityInheritance.None));
+            }
+            WriteNtSecurityDescriptorOgd(conn, parentDn, pSecProt.GetSecurityDescriptorBinaryForm());
+            return true;
+        }
+        catch (DirectoryOperationException doe)
+        {
+            error = doe.Response?.ErrorMessage ?? doe.Message;
+            Log.Warning(doe, "TrySetOuAccidentalDeletionProtection LDAP {Protect} {OuDn}", protect, ouDn);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            Log.Warning(ex, "TrySetOuAccidentalDeletionProtection {Protect} {OuDn}", protect, ouDn);
+            return false;
+        }
+    }
+
+    static bool OuIsProtectedFromAttrs(SearchResultEntry e)
+    {
+        var sfa = e.Attributes["systemFlags"];
+        if (sfa is not null && sfa.Count > 0 && TryParseDirectoryFlags(sfa[0], out var flags)
+            && ((flags & SystemFlagDisallowDeleteLegacy) != 0 || (flags & SystemFlagDisallowDeleteAccidental) != 0))
+            return true;
+
         var ad = e.Attributes["adminDescription"];
         if (ad is not null)
             for (int i = 0; i < ad.Count; i++)
-                if (string.Equals(ad[i]?.ToString(), OU_PROTECT_MARKER, StringComparison.OrdinalIgnoreCase))
+            {
+                var txt = ad[i]?.ToString() ?? "";
+                if (txt.IndexOf(OU_PROTECT_MARKER, StringComparison.OrdinalIgnoreCase) >= 0)
                     return true;
+            }
 
-        // Objets critiques système (par prudence)
         var crit = e.Attributes["isCriticalSystemObject"];
         if (crit is not null && crit.Count > 0 && string.Equals(crit[0]?.ToString(), "TRUE", StringComparison.OrdinalIgnoreCase))
             return true;
@@ -1291,7 +1839,52 @@ public class Program
         return false;
     }
 
-    // Parent valide pour une OU : soit une OU, soit la racine de domaine (domainDNS)
+    static bool OuIsProtected(LdapConnection conn, string ouDn)
+    {
+        SearchResultEntry? entry = null;
+        try
+        {
+            var req = new SearchRequest(ouDn, "(objectClass=organizationalUnit)", SearchScope.Base,
+                new[] { "adminDescription", "isCriticalSystemObject", "systemFlags", "nTSecurityDescriptor" });
+            req.Controls.Add(new DirectoryControl("1.2.840.113556.1.4.801", LdapSdFlagsControlDaclOnly, true, true));
+            var resp = (SearchResponse)conn.SendRequest(req);
+            if (resp.Entries.Count == 1)
+                entry = resp.Entries[0];
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "OuIsProtected: lecture OU avec contrôle SD échouée pour {Dn}, repli sans nTSecurityDescriptor", ouDn);
+        }
+
+        if (entry is null && !TryGetEntry(conn, ouDn, out entry,
+                new[] { "adminDescription", "isCriticalSystemObject", "systemFlags" }))
+            return false;
+
+        if (entry is null) return false;
+
+        if (TryGetNtSecurityDescriptorBytes(entry, out var ouSd) && ouSd is not null
+            && OuDaclHasEveryoneDenyDeleteAndDeleteTree(ouSd))
+        {
+            var parentDn = ParentDnOf(ouDn);
+            if (string.IsNullOrEmpty(parentDn))
+                return true;
+
+            if (TryFetchNtSecurityDescriptorDacl(conn, parentDn, out var parentSd) && parentSd is not null)
+            {
+                if (ParentDaclHasEveryoneDenyDeleteChild(parentSd))
+                    return true;
+            }
+            else
+            {
+                // Cannot read parent (permissions): OU-side pattern is enough in practice for RSAT.
+                return true;
+            }
+        }
+
+        return OuIsProtectedFromAttrs(entry);
+    }
+
+    // Valid parent for an OU: another OU or the domain root (domainDNS)
     static bool ParentAcceptsOu(LdapConnection conn, string parentDn)
     {
         if (!TryGetEntry(conn, parentDn, out var e, new[] { "objectClass" }) || e is null) return false;
@@ -1306,18 +1899,18 @@ public class Program
         return isOu || isDomain;
     }
 
-    // Mappe proprement les codes LDAP → HTTP
+    // Map LDAP result codes to HTTP status
     static int Map(ResultCode rc) => rc switch
     {
         ResultCode.NoSuchObject => 404,
-        ResultCode.NotAllowedOnNonLeaf => 409, // non vide
+        ResultCode.NotAllowedOnNonLeaf => 409, // not empty
         ResultCode.ConstraintViolation => 409,
-        ResultCode.UnwillingToPerform => 403, // souvent protections/DACL
+        ResultCode.UnwillingToPerform => 403, // often policy/DACL
         ResultCode.InsufficientAccessRights => 403,
         _ => 400
     };
 
-    // OU vide ? — on teste 1 enfant max pour perf
+    // Is OU empty? — at most one child for performance
     static bool OuIsEmpty(LdapConnection conn, string ouDn)
     {
         var req = new SearchRequest(
@@ -1364,7 +1957,7 @@ public class Program
         };
     }
     
-    // Convertit des octets en séquence \XX pour un filtre LDAP (RFC4515)
+    // Encode bytes as \XX sequence for LDAP filter (RFC4515)
     static string BytesToLdapHex(byte[] bytes)
     {
         var sb = new StringBuilder(bytes.Length * 3);
@@ -1381,7 +1974,7 @@ public class Program
     // =======================
     public static void Main(string[] args)
     {
-        // 0) Commandes utilitaires pour enregistrer / supprimer le service Windows
+        // 0) Utility CLI to register / unregister the Windows service
         if (args is { Length: > 0 })
         {
             if (Array.Exists(args, a => string.Equals(a, "--add-service", StringComparison.OrdinalIgnoreCase)))
@@ -1396,27 +1989,27 @@ public class Program
             }
         }
 
-        // 1) Bootstrap logger (avant d'avoir la config)
+        // 1) Bootstrap logger (before config is loaded)
         var bootstrapLogDir = Path.Combine(AppBase, "logs");
         BootstrapLogger(bootstrapLogDir);
 
-        // 2) Charge config (crée si absente)
+        // 2) Load config (create default if missing)
         var (cfg, loadErr, created) = LoadConfig();
         if (loadErr != null)
         {
-            Log.Fatal("[CONFIG] {Error}. Arrêt.", loadErr);
+            Log.Fatal("[CONFIG] {Error}. Exiting.", loadErr);
             Log.CloseAndFlush();
             Environment.Exit(1);
         }
 
         if (created)
         {
-            Log.Information("[CONFIG] Fichier 'config.json' créé à {Path}. Merci de le compléter puis relancez.", DefaultConfigJsonPath);
+            Log.Information("[CONFIG] Created 'config.json' at {Path}. Fill it in and restart.", DefaultConfigJsonPath);
             Log.CloseAndFlush();
             return;
         }
 
-        // 3) Reconfigure logger selon config
+        // 3) Reconfigure logger from config
         try
         {
             if (!Directory.Exists(cfg!.Debug.LogDir))
@@ -1440,35 +2033,35 @@ public class Program
             Environment.Exit(1);
         }
 
-        Log.Information("ADSelfService-API v{Version} démarrée.", AppVersion);
+        Log.Information("ADSelfService-API v{Version} started.", AppVersion);
 
-        // 4) Valide la config
+        // 4) Validate config
         var errors = ValidateConfig(cfg!);
         if (errors.Count > 0)
         {
             foreach (var e in errors) Log.Fatal("[CONFIG] {Err}", e);
-            Log.Fatal("Configuration invalide. Arrêt.");
+            Log.Fatal("Invalid configuration. Exiting.");
             Log.CloseAndFlush();
             Environment.Exit(1);
         }
 
-        // 4b) Détecte valeurs par défaut
+        // 4b) Detect placeholder / default values
         if (IsLikelyDefault(cfg))
         {
-            Log.Fatal("[CONFIG] La configuration contient encore des valeurs d'exemple (DN ou mot de passe). Modifiez 'config.json' puis relancez.");
+            Log.Fatal("[CONFIG] Configuration still contains example values (DN or password). Edit 'config.json' and restart.");
             Log.CloseAndFlush();
             Environment.Exit(1);
         }
         foreach (var w in SecurityWarnings(cfg))
             Log.Warning("[SECURITY] {Warning}", w);
 
-        // 5) Startup check LDAP
+        // 5) LDAP startup check
         if (cfg.StartupCheck.Enabled)
         {
-            // 4a) Test de connectivité TCP brute (équivalent du bouton "Connect" de ldp.exe)
+            // 4a) Raw TCP connectivity (like ldp.exe "Connect")
             if (!TestLdapTcpConnectivity(cfg, out var connErr))
             {
-                Log.Error("[STARTUP] Connectivité TCP LDAP KO: {Err}", connErr);
+                Log.Error("[STARTUP] LDAP TCP connectivity failed: {Err}", connErr);
                 if (cfg.StartupCheck.FailFast)
                 {
                     Log.CloseAndFlush();
@@ -1477,21 +2070,21 @@ public class Program
             }
             else
             {
-                Log.Information("[STARTUP] TCP LDAP OK vers {Host}:{Port}", cfg.Ldap.Url, cfg.Ldap.Port);
+                Log.Information("[STARTUP] TCP LDAP OK to {Host}:{Port}", cfg.Ldap.Url, cfg.Ldap.Port);
             }
 
-            // 4b) Test de bind du compte de service (étape suivante)
+            // 4b) Service account bind test (next step)
             try
             {
                 using var c = GetLdapConnection(cfg);
-                if (!BindServiceAccount(c, cfg)) throw new Exception("Bind du compte de service échoué.");
+                if (!BindServiceAccount(c, cfg)) throw new Exception("Service account bind failed.");
                 Log.Information("[STARTUP] Bind LDAP OK.");
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "[STARTUP] Échec de connectivité LDAP.");
+                Log.Error(ex, "[STARTUP] LDAP connectivity failed.");
                 Console.Error.WriteLine(
-                    "LDAP non joignable au démarrage. Consultez les logs dans '" + cfg.Debug.LogDir + "'."
+                    "LDAP unreachable at startup. See logs in '" + cfg.Debug.LogDir + "'."
                     + (cfg.StartupCheck.ShowDetailsInConsole ? Environment.NewLine + ex : "")
                 );
                 if (cfg.StartupCheck.FailFast)
@@ -1502,20 +2095,20 @@ public class Program
             }
         }
 
-        // 5) WebApp
+        // 5) Web application
         var builder = WebApplication.CreateBuilder(args);
         builder.Host.UseSerilog();
         if (cfg.Server.Urls?.Count > 0)
             builder.WebHost.UseUrls(cfg.Server.Urls.ToArray());
         var app = builder.Build();
 
-        // Middlewares sécurité & debug
+        // Security & debug middleware
         app.Use(async (context, next) =>
         {
             bool isHealth = string.Equals(context.Request.Path, "/health", StringComparison.OrdinalIgnoreCase);
 
-            // 1) Vérifie éventuellement la clé partagée interne (X-Internal-Auth),
-            //    sauf pour /health (qui reste accessible sans secret, mais filtré par IP).
+            // 1) Optional internal shared key (X-Internal-Auth),
+            //    except /health (no secret, but IP-filtered).
             var shared = cfg.Security.InternalSharedSecret;
             if (!isHealth && !string.IsNullOrEmpty(shared))
             {
@@ -1524,25 +2117,25 @@ public class Program
                     !string.Equals(hdr[0], shared, StringComparison.Ordinal))
                 {
                     context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
-                    await context.Response.WriteAsync("Accès interdit (clé interne).");
+                    await context.Response.WriteAsync("Forbidden (internal key).");
                     return;
                 }
             }
 
-            // 2) Vérifie la liste d'IP autorisées (y compris pour /health)
+            // 2) Allowed IP list (including /health)
             var ip = context.Connection.RemoteIpAddress ?? IPAddress.None;
             if (!IsIpAllowed(ip, cfg.Security))
             {
                 context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
-                await context.Response.WriteAsync("Accès interdit.");
+                await context.Response.WriteAsync("Forbidden.");
                 return;
             }
 
-            // 3) Contrôle de contexte applicatif (défense en profondeur, côté API)
+            // 3) Application context check (defense in depth, API-side)
             if (!IsRequestContextAllowed(context, cfg.Security))
             {
                 context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
-                await context.Response.WriteAsJsonAsync(new { error = "Accès interdit (contexte applicatif)." });
+                await context.Response.WriteAsJsonAsync(new { error = "Forbidden (application context)." });
                 return;
             }
             await next();
@@ -1662,15 +2255,15 @@ public class Program
                 bool mustChangePassword = (entry.Attributes["pwdLastSet"]?[0]?.ToString() == "0");
                 try
                 {
-                    // Connexion utilisateur : en LDAPS on utilise un bind simple (Basic + DN),
-                    // en LDAP+Kerberos on privilégie un principal UPN/DOMAIN\user si disponible.
+                    // User bind: LDAPS uses simple bind (Basic + DN);
+                    // LDAP+Kerberos prefers a UPN/DOMAIN\user principal when available.
                     string? upn = entry.Attributes["userPrincipalName"]?[0]?.ToString();
                     string loginName = upn ?? req.Username;
 
                     LdapConnection userConn;
                     if (cfg.Ldap.Ssl)
                     {
-                        // LDAPS : bind simple avec DN (transport chiffré par TLS)
+                        // LDAPS: simple bind with DN (TLS-encrypted transport)
                         var id = new LdapDirectoryIdentifier(cfg.Ldap.Url, cfg.Ldap.Port);
                         userConn = new LdapConnection(id);
                         userConn.SessionOptions.ProtocolVersion = 3;
@@ -1687,7 +2280,7 @@ public class Program
                     }
                     else
                     {
-                        // LDAP + Kerberos (UseKerberosSealing) : on utilise un principal (UPN/DOMAIN\user)
+                        // LDAP + Kerberos (UseKerberosSealing): principal (UPN/DOMAIN\user)
                         using var kConn = GetLdapConnection(cfg);
                         kConn.Bind(new NetworkCredential(loginName, req.Password));
                     }
@@ -1704,7 +2297,7 @@ public class Program
                     mustChangePassword = true;
                 }
 
-                // ==== Groupes (directs + imbriqués + groupe primaire) ====
+                // ==== Groups (direct + nested + primary) ====
                 var directMemberOfDns = GetMemberOfDns(entry.Attributes["memberOf"]);
                 var transitiveDns = GetTransitiveGroupDnsForUser(cfg, connection, userDn);
 
@@ -1737,7 +2330,7 @@ public class Program
                     telephoneNumber = entry.Attributes["telephoneNumber"]?[0]?.ToString(),
                     wwwhomepage = entry.Attributes["wWWHomePage"]?[0]?.ToString(),
                     streetAddress = entry.Attributes["streetAddress"]?[0]?.ToString(),
-                    description = entry.Attributes["description"]?[0]?.ToString() // <— AJOUTÉ
+                    description = entry.Attributes["description"]?[0]?.ToString()
                 };
 
                 await http.Response.WriteAsJsonAsync(new { success = true, user = userObj, mustChangePassword, isAdmin });
@@ -1750,7 +2343,7 @@ public class Program
             }
         });
 
-        // GET /users  — rapide par défaut, groupes optionnels
+        // GET /users — fast by default; groups optional
         app.MapGet("/users", async (HttpContext http) =>
         {
             try
@@ -1820,6 +2413,7 @@ public class Program
 
                         List<string> memberOfCn = new();
                         List<string> memberOfEffectiveCn = new();
+                        bool isAdmin = false;
 
                         if (wantGroups)
                         {
@@ -1839,6 +2433,7 @@ public class Program
                                 if (!string.IsNullOrWhiteSpace(primaryGroupDn)) effectiveDns.Add(primaryGroupDn!);
 
                                 memberOfEffectiveCn = CnsFromDns(effectiveDns);
+                                isAdmin = IsAdminEffective(effectiveDns, cfg);
                             }
                         }
 
@@ -1864,6 +2459,7 @@ public class Program
                             description = entry.Attributes["description"]?[0]?.ToString(),
                             objectGUID = guid,
                             disabled,
+                            isAdmin,
                             memberOf = wantGroups ? memberOfCn : null,
                             memberOfEffective = wantEffective ? memberOfEffectiveCn : null,
                             expiresNever = never,
@@ -1879,18 +2475,18 @@ public class Program
                     {
                         if (taken >= want)
                         {
-                            // On a rempli la page demandée ; "hasMore" est vrai seulement s'il reste des pages côté DC
+                            // Filled requested page; hasMore only if DC has more pages
                             hasMore = prc != null && prc.Cookie.Length != 0;
                             break;
                         }
 
                         if (prc == null || prc.Cookie.Length == 0)
                         {
-                            hasMore = false; // rien après cette page
+                            hasMore = false; // no further pages
                             break;
                         }
 
-                        pageControl.Cookie = prc.Cookie; // on continue à la page suivante côté DC
+                        pageControl.Cookie = prc.Cookie; // next DC page
                     }
                     else
                     {
@@ -1939,12 +2535,11 @@ public class Program
                 bool wantEffective = groupsMode == "effective";
 
                 var attrs = new List<string> {
-                    "distinguishedName","sAMAccountName","givenName","sn","mail","pwdLastSet",
+                    "distinguishedName","sAMAccountName","userPrincipalName","givenName","sn","mail","pwdLastSet",
                     "telephoneNumber","wWWHomePage","streetAddress","objectGUID","userAccountControl",
-                    "description", "accountExpires"
+                    "description", "accountExpires", "primaryGroupID", "objectSid"
                 };
                 if (wantGroups) attrs.Add("memberOf");
-                if (wantEffective) { attrs.Add("primaryGroupID"); attrs.Add("objectSid"); }
 
                 var safeSam = EscapeLdapFilterValue(sam);
                 var request = new SearchRequest(
@@ -2005,23 +2600,36 @@ public class Program
 
                 var (expAt, never) = DecodeAccountExpiresFromEntry(entry);
 
+                string? primaryGroupDnVal = null;
+                int? primaryGroupIdVal = null;
+                try
+                {
+                    if (TryReadPrimaryGroupRid(entry, out var pgi))
+                        primaryGroupIdVal = pgi;
+                    primaryGroupDnVal = GetPrimaryGroupDn(cfg, connection, entry);
+                }
+                catch (Exception ex) { Log.Warning(ex, "Primary group for GET /user"); }
+
                 var user = new
                 {
                     dn = entry.DistinguishedName,
                     sAMAccountName = entry.Attributes["sAMAccountName"]?[0]?.ToString(),
+                    userPrincipalName = entry.Attributes["userPrincipalName"]?[0]?.ToString(),
                     givenName = entry.Attributes["givenName"]?[0]?.ToString(),
                     sn = entry.Attributes["sn"]?[0]?.ToString(),
                     mail = entry.Attributes["mail"]?[0]?.ToString(),
                     telephoneNumber = entry.Attributes["telephoneNumber"]?[0]?.ToString(),
                     wwwhomepage = entry.Attributes["wWWHomePage"]?[0]?.ToString(),
                     streetAddress = entry.Attributes["streetAddress"]?[0]?.ToString(),
-                    description = entry.Attributes["description"]?[0]?.ToString(), // <— AJOUTÉ
+                    description = entry.Attributes["description"]?[0]?.ToString(),
                     objectGUID = guid,
                     disabled,
                     mustChangePassword,
                     isAdmin,
                     memberOf = wantGroups ? memberOfCn : null,
                     memberOfEffective = wantEffective ? memberOfEffectiveCn : null,
+                    primaryGroupDn = primaryGroupDnVal,
+                    primaryGroupId = primaryGroupIdVal,
                     expiresNever = never,
                     expiresAt = expAt?.ToString("o")
                 };
@@ -2063,7 +2671,7 @@ public class Program
                     var key = kv.Key;
                     var val = kv.Value;
 
-                    // petite validation côté API pour description
+                    // Light API-side validation for description
                     if (string.Equals(key, "description", StringComparison.OrdinalIgnoreCase) && val is not null && val.Length > 1024)
                     {
                         http.Response.StatusCode = 400;
@@ -2098,7 +2706,7 @@ public class Program
                 catch (DirectoryOperationException doe)
                 {
                     var msg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
-                    // Beaucoup de DC renvoient "No such attribute" quand on supprime une valeur absente -> considérer OK
+                    // Many DCs return "No such attribute" when deleting a missing value — treat as OK
                     if (msg.IndexOf("No such attribute", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         await http.Response.WriteAsJsonAsync(new { success = true, note = "Certains attributs étaient déjà absents." });
@@ -2152,9 +2760,9 @@ public class Program
 
                 try
                 {
-                    // Vérifie le mot de passe actuel en se comportant comme pour /auth :
-                    // - en LDAPS : bind simple (Basic + DN) sur TLS
-                    // - en LDAP+Kerberos : bind avec principal (UPN/DOMAIN\user si possible)
+                    // Verify current password same way as /auth:
+                    // - LDAPS: simple bind (Basic + DN) over TLS
+                    // - LDAP+Kerberos: bind with principal (UPN/DOMAIN\user when possible)
                     string loginName = req.Username;
 
                     if (cfg.Ldap.Ssl)
@@ -2206,7 +2814,7 @@ public class Program
             }
         });
 
-        // POST /admin/changePassword  (avec MustChangeAtNextLogon)
+        // POST /admin/changePassword (optional MustChangeAtNextLogon)
         app.MapPost("/admin/changePassword", async (HttpContext http) =>
         {
             try
@@ -2289,16 +2897,16 @@ public class Program
                     return;
                 }
 
-                // Résoudre DN + UAC sans 'dynamic'
+                // Resolve DN + UAC without 'dynamic'
                 string userDn;
                 int? uac = null;
 
                 if (req.User.Contains("DC=", StringComparison.OrdinalIgnoreCase))
                 {
-                    // L'utilisateur a fourni un DN complet
+                    // Caller supplied full DN
                     userDn = req.User;
 
-                    // Lire userAccountControl au niveau Base
+                    // Read userAccountControl at Base scope
                     var baseReq = new SearchRequest(
                         userDn,
                         "(objectClass=user)",
@@ -2317,7 +2925,7 @@ public class Program
                 }
                 else
                 {
-                    // On nous a donné un sAMAccountName
+                    // sAMAccountName lookup
                     var safe = EscapeLdapFilterValue(req.User);
                     var sReq = new SearchRequest(
                         cfg.Ldap.BaseDn,
@@ -2376,6 +2984,32 @@ public class Program
                     return;
                 }
 
+                var upnForLdap = req.UserPrincipalName.Trim();
+                if (!string.IsNullOrWhiteSpace(req.CloneSourceSam) && !string.IsNullOrWhiteSpace(req.CloneSourceUserPrincipalName))
+                {
+                    upnForLdap = UserPrincipalNameCloneNormalization.NormalizeSubmittedUpnForClone(
+                        upnForLdap,
+                        req.Sam.Trim(),
+                        req.CloneSourceSam.Trim(),
+                        req.CloneSourceUserPrincipalName.Trim());
+                }
+
+                if (string.IsNullOrWhiteSpace(upnForLdap))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "userPrincipalName invalide après normalisation (clonage)." });
+                    return;
+                }
+
+                // Normalize target OU (trim stray spaces) and ensure it exists.
+                var targetOuDn = req.OuDn.Trim();
+                if (string.IsNullOrWhiteSpace(targetOuDn))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "OU cible invalide." });
+                    return;
+                }
+
                 using var connection = GetLdapConnection(cfg);
                 if (!BindServiceAccount(connection, cfg))
                 {
@@ -2384,7 +3018,30 @@ public class Program
                     return;
                 }
 
-                string userDn = $"CN={req.Cn},{req.OuDn}";
+                try
+                {
+                    var chk = new SearchRequest(
+                        targetOuDn,
+                        "(|(objectClass=organizationalUnit)(objectClass=container))",
+                        SearchScope.Base,
+                        "distinguishedName");
+                    var chkResp = await Task.Run(() => (SearchResponse)connection.SendRequest(chk));
+                    if (chkResp.Entries.Count == 0)
+                    {
+                        http.Response.StatusCode = 404;
+                        await http.Response.WriteAsJsonAsync(new { error = "OU/Conteneur cible introuvable." });
+                        return;
+                    }
+                }
+                catch (DirectoryOperationException doe)
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "OU cible invalide (DN).", serverError = doe.Response?.ErrorMessage ?? doe.Message });
+                    return;
+                }
+
+                // Build a valid user DN (CN escaped correctly).
+                string userDn = $"CN={EscapeRdnValue(req.Cn)},{targetOuDn}";
                 var addReq = new AddRequest(userDn,
                     new DirectoryAttribute("objectClass", "top", "person", "organizationalPerson", "user"),
                     new DirectoryAttribute("cn", req.Cn),
@@ -2392,7 +3049,7 @@ public class Program
                     new DirectoryAttribute("givenName", req.GivenName),
                     new DirectoryAttribute("displayName", req.Cn),
                     new DirectoryAttribute("sAMAccountName", req.Sam),
-                    new DirectoryAttribute("userPrincipalName", req.UserPrincipalName),
+                    new DirectoryAttribute("userPrincipalName", upnForLdap),
                     new DirectoryAttribute("userAccountControl", "514") // disabled at creation
                 );
                 if (!string.IsNullOrWhiteSpace(req.Mail))
@@ -2514,7 +3171,7 @@ public class Program
                     return;
                 }
 
-                // Résolution DN : DN direct ou recherche par sAMAccountName
+                // Resolve DN: direct DN or search by sAMAccountName
                 string userDn = req.User.Contains("DC=", StringComparison.OrdinalIgnoreCase)
                     ? req.User
                     : (SearchUserBySam(cfg, req.User) as dynamic)?.dn;
@@ -2526,7 +3183,7 @@ public class Program
                     return;
                 }
 
-                // Construire TOUTES les modifs en une seule requête
+                // Apply all modifications in a single LDAP request
                 var mods = new List<DirectoryAttributeModification>();
                 foreach (var kv in req.Attributes)
                 {
@@ -2535,7 +3192,7 @@ public class Program
 
                     var val = kv.Value?.Trim();
 
-                    // Validation légère : description trop longue
+                    // Light validation: description too long
                     if (attrName.Equals("description", StringComparison.OrdinalIgnoreCase) && val is not null && val.Length > 1024)
                     {
                         http.Response.StatusCode = 400;
@@ -2551,7 +3208,7 @@ public class Program
                     }
                     else
                     {
-                        m.Operation = DirectoryAttributeOperation.Delete; // Champ vidé => suppression
+                        m.Operation = DirectoryAttributeOperation.Delete; // empty field => remove attribute
                     }
                     mods.Add(m);
                 }
@@ -2569,7 +3226,7 @@ public class Program
             }
             catch (DirectoryOperationException doe)
             {
-                    // Idempotence : supprimer un attribut déjà absent -> considérer OK
+                    // Idempotent: deleting an already-absent attribute -> OK
                     var serverMsg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
                     if (serverMsg.IndexOf("No such attribute", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
@@ -2593,7 +3250,7 @@ public class Program
             }
         });
 
-        // GET /groups  (liste des groupes avec id/cn/dn/sam/description, pagination + recherche)
+        // GET /groups — list groups (id/cn/dn/sam/description), pagination + search
         app.MapGet("/groups", async (HttpContext http) =>
         {
             try
@@ -2666,7 +3323,7 @@ public class Program
                     {
                         if (taken >= want)
                         {
-                            // On a rendu autant d'items que demandé ; vérifier s'il reste des pages côté DC
+                            // Returned requested item count; check if DC has more pages
                             hasMore = prc != null && prc.Cookie.Length != 0;
                             break;
                         }
@@ -2704,7 +3361,7 @@ public class Program
             }
         });
 
-        // GET /meta/ad  — métadonnées AD utiles au client
+        // GET /meta/ad — AD metadata for the client
         app.MapGet("/meta/ad", async (HttpContext http) =>
         {
             try
@@ -2726,7 +3383,7 @@ public class Program
         });
 
         // GET /recovery/lookup
-        // Recherche ciblée pour le flux "mot de passe oublié" (évite de parcourir /users côté PHP).
+        // Targeted search for forgot-password flow (avoids scanning /users from PHP).
         app.MapGet("/recovery/lookup", async (HttpContext http) =>
         {
             try
@@ -2768,7 +3425,7 @@ public class Program
                         return;
                     }
 
-                    // Cible d'abord les entrées qui exposent un téléphone, puis on compare après normalisation.
+                    // Prefer entries that expose a phone, then compare after normalization.
                     req = new SearchRequest(
                         cfg.Ldap.BaseDn,
                         "(&(&(objectCategory=person)(objectClass=user))(telephoneNumber=*))",
@@ -3075,13 +3732,25 @@ public class Program
                     return;
                 }
 
-                var direct = GetDirectUserGroupDns(connection, userDn);
+                int? primaryGroupIdVal = null;
+                string? primaryGroupDnVal = null;
+                if (TryGetEntry(connection, userDn, out var userEntryUg, new[] { "primaryGroupID", "objectSid" }) && userEntryUg is not null)
+                {
+                    if (TryReadPrimaryGroupRid(userEntryUg, out var pgrUg))
+                        primaryGroupIdVal = pgrUg;
+                    try { primaryGroupDnVal = GetPrimaryGroupDn(cfg, connection, userEntryUg); }
+                    catch (Exception ex) { Log.Warning(ex, "[GET /explorer/user-groups] Résolution groupe principal échouée."); }
+                }
+
+                var direct = GetDirectUserGroupDns(cfg, connection, userDn);
                 var groups = direct.Select(dn => GroupDtoFromDn(connection, dn)).ToList();
                 await http.Response.WriteAsJsonAsync(new
                 {
                     user = userDn,
                     count = groups.Count,
-                    groups
+                    groups,
+                    primaryGroupDn = primaryGroupDnVal,
+                    primaryGroupId = primaryGroupIdVal
                 });
             }
             catch (Exception ex)
@@ -3121,7 +3790,7 @@ public class Program
                     return;
                 }
 
-                var current = new HashSet<string>(GetDirectUserGroupDns(connection, userDn), StringComparer.OrdinalIgnoreCase);
+                var current = new HashSet<string>(GetDirectUserGroupDns(cfg, connection, userDn), StringComparer.OrdinalIgnoreCase);
                 var target = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var input in req.Groups ?? new List<string>())
                 {
@@ -3131,8 +3800,30 @@ public class Program
                     if (!string.IsNullOrWhiteSpace(groupDn)) target.Add(groupDn);
                 }
 
+                string? primaryGroupDn = null;
+                if (TryGetEntry(connection, userDn, out var userEntryPg, new[] { "primaryGroupID", "objectSid" }) && userEntryPg is not null)
+                {
+                    try { primaryGroupDn = GetPrimaryGroupDn(cfg, connection, userEntryPg); }
+                    catch { /* ignore */ }
+                }
+
+                if (!string.IsNullOrWhiteSpace(primaryGroupDn)
+                    && !target.Contains(primaryGroupDn, StringComparer.OrdinalIgnoreCase))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new
+                    {
+                        error = "Le groupe principal ne peut pas être retiré de la liste tant qu’il reste le groupe principal du compte. Modifiez d’abord le groupe principal (modifier l’utilisateur), ou laissez ce groupe dans la liste.",
+                        code = "primary_group_required",
+                        primaryGroupDn
+                    });
+                    return;
+                }
+
                 var toAdd = target.Except(current, StringComparer.OrdinalIgnoreCase).ToList();
                 var toRemove = current.Except(target, StringComparer.OrdinalIgnoreCase).ToList();
+                if (!string.IsNullOrWhiteSpace(primaryGroupDn))
+                    toRemove = toRemove.Where(g => !g.Equals(primaryGroupDn, StringComparison.OrdinalIgnoreCase)).ToList();
 
                 foreach (var gdn in toAdd)
                 {
@@ -3159,7 +3850,7 @@ public class Program
                     }
                 }
 
-                var updated = GetDirectUserGroupDns(connection, userDn).Select(dn => GroupDtoFromDn(connection, dn)).ToList();
+                var updated = GetDirectUserGroupDns(cfg, connection, userDn).Select(dn => GroupDtoFromDn(connection, dn)).ToList();
                 await http.Response.WriteAsJsonAsync(new
                 {
                     success = true,
@@ -3334,7 +4025,7 @@ public class Program
             }
         });
 
-        // GET /explorer/object?dn=<DN>  — détails d’un objet AD
+        // GET /explorer/object?dn=<DN> — AD object details
         app.MapGet("/explorer/object", async (HttpContext http) =>
         {
             try
@@ -3371,7 +4062,8 @@ public class Program
                     "whenCreated", "whenChanged", "userAccountControl", "isCriticalSystemObject",
                     "adminDescription", "lockoutTime", "pwdLastSet",
                     "dNSHostName", "operatingSystem", "operatingSystemVersion", "managedBy",
-                    "streetAddress", "wWWHomePage", "lastLogonTimestamp", "lastLogon"
+                    "streetAddress", "wWWHomePage", "lastLogonTimestamp", "lastLogon",
+                    "accountExpires", "primaryGroupID", "objectSid"
                 };
                 if (!TryGetEntry(connection, dn, out var entry, attrs) || entry is null)
                 {
@@ -3393,8 +4085,24 @@ public class Program
 
                 var members = entry.Attributes["member"]?.GetValues(typeof(string)).Cast<string>().ToArray()
                               ?? Array.Empty<string>();
-                var memberOf = entry.Attributes["memberOf"]?.GetValues(typeof(string)).Cast<string>().ToArray()
-                               ?? Array.Empty<string>();
+                var memberOfList = entry.Attributes["memberOf"]?.GetValues(typeof(string)).Cast<string>()
+                    .Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+                    ?? new List<string>();
+                int? explorerPrimaryGroupId = null;
+                string? explorerPrimaryGroupDn = null;
+                if (string.Equals(type, "user", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(type, "inetOrgPerson", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(type, "computer", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (TryReadPrimaryGroupRid(entry, out var pge))
+                        explorerPrimaryGroupId = pge;
+                    string? primaryDn = null;
+                    try { primaryDn = explorerPrimaryGroupDn = GetPrimaryGroupDn(cfg, connection, entry); }
+                    catch (Exception ex) { Log.Warning(ex, "[GET /explorer/object] Primary group resolution failed."); }
+                    if (!string.IsNullOrWhiteSpace(primaryDn) && !memberOfList.Exists(d => d.Equals(primaryDn, StringComparison.OrdinalIgnoreCase)))
+                        memberOfList.Insert(0, primaryDn);
+                }
+                var memberOf = memberOfList.ToArray();
                 var dnsHostName = entry.Attributes["dNSHostName"]?[0]?.ToString();
                 var hostIps = await ResolveHostIpsAsync(dnsHostName);
                 var whenCreatedRaw = entry.Attributes["whenCreated"]?[0]?.ToString();
@@ -3405,6 +4113,25 @@ public class Program
                 var lastLogonRaw = entry.Attributes["lastLogon"]?[0]?.ToString();
                 var lastBindAtUtc = ParseAdFileTimeUtc(lastLogonRaw) ?? ParseAdFileTimeUtc(lastLogonTsRaw);
 
+                var (accountExpiresAtUtc, accountNeverExpires) = DecodeAccountExpiresFromEntry(entry);
+                var mustChangePasswordAtNextLogon = PwdMustChangeAtNextLogon(entry);
+
+                var caps = BuildExplorerCapabilities(type, underBaseDn);
+                var deleteGroupBlocked = false;
+                string? deleteGroupBlockedDetail = null;
+                if (string.Equals(type, "group", StringComparison.OrdinalIgnoreCase))
+                {
+                    var gSidB = ReadObjectSidBytes(entry);
+                    if (TryGetRidFromObjectSidBytes(gSidB, out var grid)
+                        && AnyUserOrComputerUsesPrimaryGroupRid(connection, EffectiveExplorerBaseDn(cfg), grid))
+                    {
+                        deleteGroupBlocked = true;
+                        deleteGroupBlockedDetail =
+                            "Ce groupe est le groupe principal d’au moins un compte utilisateur ou ordinateur. Modifiez d’abord le groupe principal de ces comptes avant suppression.";
+                        caps["canDeleteGroup"] = false;
+                    }
+                }
+
                 await http.Response.WriteAsJsonAsync(new
                 {
                     dn,
@@ -3413,7 +4140,9 @@ public class Program
                     underBaseDn,
                     protectedOu = type == "ou" ? OuIsProtected(connection, dn) : false,
                     isDisabled,
-                    capabilities = BuildExplorerCapabilities(type, underBaseDn),
+                    deleteGroupBlocked,
+                    deleteGroupBlockedDetail,
+                    capabilities = caps,
                     attributes = new
                     {
                         name = entry.Attributes["name"]?[0]?.ToString(),
@@ -3428,6 +4157,9 @@ public class Program
                         telephoneNumber = entry.Attributes["telephoneNumber"]?[0]?.ToString(),
                         streetAddress = entry.Attributes["streetAddress"]?[0]?.ToString(),
                         website = entry.Attributes["wWWHomePage"]?[0]?.ToString(),
+                        accountNeverExpires,
+                        accountExpiresUtc = accountExpiresAtUtc?.ToString("o"),
+                        mustChangePasswordAtNextLogon,
                         whenCreated = whenCreatedRaw,
                         whenChanged = whenChangedRaw,
                         createdAtUtc = createdAtUtc?.ToString("o"),
@@ -3447,7 +4179,9 @@ public class Program
                         lastUserConnected = entry.Attributes["managedBy"]?[0]?.ToString(),
                         memberCount = members.Length,
                         memberOfCount = memberOf.Length,
-                        memberOf
+                        memberOf,
+                        primaryGroupId = explorerPrimaryGroupId,
+                        primaryGroupDn = explorerPrimaryGroupDn
                     }
                 });
             }
@@ -3459,7 +4193,7 @@ public class Program
             }
         });
 
-        // GET /explorer/children?dn=<DN>&max=200  — enfants directs d’un objet
+        // GET /explorer/children?dn=<DN>&max=200 — direct children of an object
         app.MapGet("/explorer/children", async (HttpContext http) =>
         {
             try
@@ -3491,15 +4225,33 @@ public class Program
                     return;
                 }
 
-                var req = new SearchRequest(
-                    dn,
-                    "(objectClass=*)",
-                    SearchScope.OneLevel,
-                    new[] { "distinguishedName", "name", "cn", "ou", "description", "objectClass" });
-                req.SizeLimit = max;
-                var resp = (SearchResponse)connection.SendRequest(req);
+                var searchAttrs = new[] { "distinguishedName", "name", "cn", "ou", "description", "objectClass" };
+                var collected = new List<SearchResultEntry>();
+                byte[]? pageCookie = null;
+                var pageSize = Math.Min(1000, Math.Max(64, max));
 
-                var children = resp.Entries.Cast<SearchResultEntry>()
+                while (collected.Count < max)
+                {
+                    var req = new SearchRequest(dn, "(objectClass=*)", SearchScope.OneLevel, searchAttrs);
+                    req.SizeLimit = 0;
+                    var prq = new PageResultRequestControl(pageSize);
+                    if (pageCookie is { Length: > 0 }) prq.Cookie = pageCookie;
+                    req.Controls.Add(prq);
+
+                    var resp = (SearchResponse)connection.SendRequest(req);
+                    foreach (SearchResultEntry e in resp.Entries)
+                    {
+                        collected.Add(e);
+                        if (collected.Count >= max) break;
+                    }
+
+                    var prc = resp.Controls.OfType<PageResultResponseControl>().FirstOrDefault();
+                    if (collected.Count >= max) break;
+                    if (prc is null || prc.Cookie is null || prc.Cookie.Length == 0) break;
+                    pageCookie = prc.Cookie;
+                }
+
+                var children = collected
                     .Select(e =>
                     {
                         var childType = GetNodeTypeFromEntry(e);
@@ -3534,7 +4286,7 @@ public class Program
             }
         });
 
-        // GET /tree  — arborescence à partir d’un DN
+        // GET /tree — subtree from a DN
         app.MapGet("/tree", async (HttpContext http) =>
         {
             try
@@ -3547,7 +4299,7 @@ public class Program
                     return;
                 }
 
-                // Paramètres
+                // Query parameters
                 string explorerBaseDn = EffectiveExplorerBaseDn(cfg);
                 string baseDn = http.Request.Query["baseDn"].FirstOrDefault() ?? explorerBaseDn;
                 if (!DnIsUnder(baseDn, explorerBaseDn))
@@ -3586,7 +4338,7 @@ public class Program
             }
         });
 
-        // POST /admin/enableUser  (alias clair de setUserEnabled: true)
+        // POST /admin/enableUser (alias for setUserEnabled: true)
         // Body JSON: { "user": "<sAMAccountName|DN>" }
         app.MapPost("/admin/enableUser", async (HttpContext http) =>
         {
@@ -3666,7 +4418,7 @@ public class Program
             }
         });
 
-        // POST /admin/disableUser  (alias clair de setUserEnabled: false)
+        // POST /admin/disableUser (alias for setUserEnabled: false)
         // Body JSON: { "user": "<sAMAccountName|DN>" }
         app.MapPost("/admin/disableUser", async (HttpContext http) =>
         {
@@ -3754,6 +4506,15 @@ public class Program
                     return;
                 }
 
+                // Normalize target OU (avoid stray spaces/tags in DN)
+                var targetOuDn = req.NewOuDn.Trim();
+                if (string.IsNullOrWhiteSpace(targetOuDn))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "OU cible invalide." });
+                    return;
+                }
+
                 using var connection = GetLdapConnection(cfg);
                 if (!BindServiceAccount(connection, cfg))
                 {
@@ -3762,7 +4523,7 @@ public class Program
                     return;
                 }
 
-                // Résoudre le DN utilisateur
+                // Resolve user DN
                 string userDn;
                 if (req.User.Contains("DC=", StringComparison.OrdinalIgnoreCase))
                 {
@@ -3781,17 +4542,31 @@ public class Program
                     userDn = sResp.Entries[0].DistinguishedName;
                 }
 
-                // Vérifier que la cible existe (OU/container)
-                var chk = new SearchRequest(req.NewOuDn, "(|(objectClass=organizationalUnit)(objectClass=container))", SearchScope.Base, "distinguishedName");
-                var chkResp = await Task.Run(() => (SearchResponse)connection.SendRequest(chk));
-                if (chkResp.Entries.Count == 0) { http.Response.StatusCode = 404; await http.Response.WriteAsJsonAsync(new { error = "OU cible introuvable." }); return; }
+                // Ensure target exists (OU/container)
+                try
+                {
+                    var chk = new SearchRequest(targetOuDn, "(|(objectClass=organizationalUnit)(objectClass=container))", SearchScope.Base, "distinguishedName");
+                    var chkResp = await Task.Run(() => (SearchResponse)connection.SendRequest(chk));
+                    if (chkResp.Entries.Count == 0)
+                    {
+                        http.Response.StatusCode = 404;
+                        await http.Response.WriteAsJsonAsync(new { error = "OU cible introuvable." });
+                        return;
+                    }
+                }
+                catch (DirectoryOperationException doe)
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "OU cible invalide (DN).", serverError = doe.Response?.ErrorMessage ?? doe.Message });
+                    return;
+                }
 
-                // Garder le même RDN (CN=...)
+                // Keep same RDN (CN=...)
                 var rdn = userDn.Split(',')[0]; // ex. "CN=John Doe"
-                var move = new ModifyDNRequest(userDn, req.NewOuDn, rdn) { DeleteOldRdn = true };
+                var move = new ModifyDNRequest(userDn, targetOuDn, rdn) { DeleteOldRdn = true };
                 _ = (ModifyDNResponse)connection.SendRequest(move);
 
-                await http.Response.WriteAsJsonAsync(new { success = true, dn = $"{rdn},{req.NewOuDn}" });
+                await http.Response.WriteAsJsonAsync(new { success = true, dn = $"{rdn},{targetOuDn}" });
             }
             catch (DirectoryOperationException doe) {
                 http.Response.StatusCode = 400;
@@ -3825,7 +4600,7 @@ public class Program
                     return;
                 }
 
-                // Résoudre l’utilisateur en DN (accepte DN ou sAM)
+                // Resolve user to DN (accepts DN or sAM)
                 string userDn = LooksLikeDn(req.User)
                     ? req.User
                     : (SearchUserBySam(cfg, req.User) as dynamic)?.dn;
@@ -3837,7 +4612,7 @@ public class Program
                     return;
                 }
 
-                // Déverrouillage = remettre lockoutTime à 0
+                // Unlock = set lockoutTime to 0
                 var mod = new DirectoryAttributeModification
                 {
                     Operation = DirectoryAttributeOperation.Replace,
@@ -3852,7 +4627,7 @@ public class Program
             }
             catch (DirectoryOperationException doe)
             {
-                // Si déjà déverrouillé, certains DC renvoient "No such attribute"
+                // If already unlocked, some DCs return "No such attribute"
                 var msg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
                 if (msg.IndexOf("No such attribute", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
@@ -3893,7 +4668,7 @@ public class Program
                     return;
                 }
 
-                // Résoudre DN
+                // Resolve DN
                 string userDn = LooksLikeDn(req.User)
                     ? req.User
                     : (SearchUserBySam(cfg, req.User) as dynamic)?.dn;
@@ -3905,7 +4680,7 @@ public class Program
                     return;
                 }
 
-                // Parent DN = DN sans le 1er RDN
+                // Parent DN = user DN without first RDN component
                 var parts = userDn.Split(',', 2);
                 if (parts.Length < 2)
                 {
@@ -3956,7 +4731,7 @@ public class Program
                     return;
                 }
 
-                // Vérifier que l’OU cible existe
+                // Ensure target OU exists
                 var chk = new SearchRequest(req.OuDn, "(|(objectClass=organizationalUnit)(objectClass=container))", SearchScope.Base, "distinguishedName");
                 var chkResp = await Task.Run(() => (SearchResponse)connection.SendRequest(chk));
                 if (chkResp.Entries.Count == 0)
@@ -3969,7 +4744,7 @@ public class Program
                 string groupDn = $"CN={EscapeRdnValue(req.Cn)},{req.OuDn}";
                 var groupType = ComputeGroupType(req.Scope, req.SecurityEnabled);
 
-                // sAM facultatif -> si absent, on dérive depuis le CN (sans espaces)
+                // Optional sAM — if omitted, derive from CN (no spaces)
                 var sam = string.IsNullOrWhiteSpace(req.Sam)
                     ? req.Cn.Replace(' ', '_')
                     : req.Sam;
@@ -3979,7 +4754,7 @@ public class Program
                     new DirectoryAttribute("objectClass", "top", "group"),
                     new DirectoryAttribute("cn", req.Cn),
                     new DirectoryAttribute("sAMAccountName", sam),
-                    new DirectoryAttribute("groupType", groupType.ToString()) // AD attend un int signé
+                    new DirectoryAttribute("groupType", groupType.ToString()) // AD expects signed int string
                 );
                 if (!string.IsNullOrWhiteSpace(req.Description))
                     add.Attributes.Add(new DirectoryAttribute("description", req.Description));
@@ -4024,12 +4799,32 @@ public class Program
                     return;
                 }
 
-                // Résolution du DN si besoin
+                // Resolve DN when needed
                 string? groupDn = LooksLikeDn(input) ? input : ResolveGroupDn(cfg, connection, input);
                 if (string.IsNullOrWhiteSpace(groupDn))
                 {
                     http.Response.StatusCode = 404;
                     await http.Response.WriteAsJsonAsync(new { error = "Groupe introuvable." });
+                    return;
+                }
+
+                if (!TryGetEntry(connection, groupDn, out var gDelEntry, new[] { "objectSid" }) || gDelEntry is null)
+                {
+                    http.Response.StatusCode = 404;
+                    await http.Response.WriteAsJsonAsync(new { error = "Groupe introuvable (lecture LDAP)." });
+                    return;
+                }
+
+                var gSidDel = ReadObjectSidBytes(gDelEntry);
+                if (TryGetRidFromObjectSidBytes(gSidDel, out var ridDel)
+                    && AnyUserOrComputerUsesPrimaryGroupRid(connection, EffectiveExplorerBaseDn(cfg), ridDel))
+                {
+                    http.Response.StatusCode = 409;
+                    await http.Response.WriteAsJsonAsync(new
+                    {
+                        error = "Impossible de supprimer ce groupe : il est le groupe principal d’au moins un compte utilisateur ou ordinateur. Changez d’abord le groupe principal de ces comptes.",
+                        code = "primary_group_in_use"
+                    });
                     return;
                 }
 
@@ -4073,7 +4868,7 @@ public class Program
                     return;
                 }
 
-                // Résoudre DN
+                // Resolve DN
                 string userDn;
                 if (LooksLikeDn(req.User)) userDn = req.User;
                 else
@@ -4119,6 +4914,65 @@ public class Program
             }
         });
 
+        // POST /admin/setUserPrimaryGroup  Body: { "user": "<sAM|DN>", "group": "<sAM|CN|DN>" }
+        app.MapPost("/admin/setUserPrimaryGroup", async (HttpContext http) =>
+        {
+            try
+            {
+                var req = await http.Request.ReadFromJsonAsync<SetUserPrimaryGroupRequest>();
+                if (req is null || string.IsNullOrWhiteSpace(req.User) || string.IsNullOrWhiteSpace(req.Group))
+                {
+                    http.Response.StatusCode = 400;
+                    await http.Response.WriteAsJsonAsync(new { error = "user et group requis." });
+                    return;
+                }
+
+                using var connection = GetLdapConnection(cfg);
+                if (!BindServiceAccount(connection, cfg))
+                {
+                    http.Response.StatusCode = 500;
+                    await http.Response.WriteAsJsonAsync(new { error = "Bind LDAP échoué." });
+                    return;
+                }
+
+                var userDn = ResolveUserDn(cfg, connection, req.User.Trim());
+                if (string.IsNullOrWhiteSpace(userDn))
+                {
+                    http.Response.StatusCode = 404;
+                    await http.Response.WriteAsJsonAsync(new { error = "Utilisateur introuvable." });
+                    return;
+                }
+
+                var groupDn = ResolveGroupDn(cfg, connection, req.Group.Trim());
+                if (string.IsNullOrWhiteSpace(groupDn))
+                {
+                    http.Response.StatusCode = 404;
+                    await http.Response.WriteAsJsonAsync(new { error = "Groupe introuvable." });
+                    return;
+                }
+
+                SetUserPrimaryGroup(cfg, connection, userDn, groupDn);
+                await http.Response.WriteAsJsonAsync(new { success = true, userDn, groupDn });
+            }
+            catch (InvalidOperationException iox)
+            {
+                http.Response.StatusCode = 400;
+                await http.Response.WriteAsJsonAsync(new { error = iox.Message });
+            }
+            catch (DirectoryOperationException doe)
+            {
+                Log.Error(doe, "[POST /admin/setUserPrimaryGroup] DirectoryOperationException");
+                http.Response.StatusCode = 400;
+                await http.Response.WriteAsJsonAsync(new { error = doe.Message, serverError = doe.Response?.ErrorMessage });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[POST /admin/setUserPrimaryGroup] Exception");
+                http.Response.StatusCode = 500;
+                await http.Response.WriteAsJsonAsync(new { error = ex.Message });
+            }
+        });
+
         // POST /admin/ou/create
         app.MapPost("/admin/ou/create", async (HttpContext http) =>
         {
@@ -4132,10 +4986,13 @@ public class Program
                     return;
                 }
 
-                if (!DnIsUnder(req.ParentDn, cfg.Ldap.BaseDn))
+                var parentDn = req.ParentDn.Trim();
+                var ouName = req.Name.Trim();
+                var explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+                if (!DnIsUnder(parentDn, explorerBaseDn))
                 {
                     http.Response.StatusCode = 403;
-                    await http.Response.WriteAsJsonAsync(new { error = "ParentDn non autorisé (hors baseDn)." });
+                    await http.Response.WriteAsJsonAsync(new { error = "ParentDn non autorisé (hors baseDn explorateur)." });
                     return;
                 }
 
@@ -4147,29 +5004,50 @@ public class Program
                     return;
                 }
 
-                // Vérifier que le parent est un conteneur valide (OU/container/domaine)
-                if (!TryGetEntry(connection, req.ParentDn, out var parent, new[] { "objectClass", "objectCategory" }) || parent is null || !EntryIsContainer(parent))
+                // Ensure parent is a valid container (OU/container/domain)
+                if (!TryGetEntry(connection, parentDn, out var parent, new[] { "objectClass", "objectCategory" }) || parent is null || !EntryIsContainer(parent))
                 {
                     http.Response.StatusCode = 404;
                     await http.Response.WriteAsJsonAsync(new { error = "DN parent introuvable ou non conteneur." });
                     return;
                 }
 
-                var ouDn = NewOuDn(req.ParentDn, req.Name);
+                var ouDn = NewOuDn(parentDn, ouName);
 
                 var add = new AddRequest(
                     ouDn,
                     new DirectoryAttribute("objectClass", "top", "organizationalUnit"),
-                    new DirectoryAttribute("ou", req.Name)
+                    new DirectoryAttribute("ou", ouName)
                 );
 
                 if (!string.IsNullOrWhiteSpace(req.Description))
                     add.Attributes.Add(new DirectoryAttribute("description", req.Description));
 
-                if (req.Protected == true)
-                    add.Attributes.Add(new DirectoryAttribute("adminDescription", OU_PROTECT_MARKER));
-
                 _ = (AddResponse)connection.SendRequest(add);
+
+                // Protection = DACL (RSAT), not adminDescription (often unset on organizationalUnit).
+                if (req.Protected == true)
+                {
+                    if (!TrySetOuAccidentalDeletionProtection(connection, ouDn, true, out var protErr))
+                    {
+                        try
+                        {
+                            _ = (DeleteResponse)connection.SendRequest(new DeleteRequest(ouDn));
+                        }
+                        catch (Exception delEx)
+                        {
+                            Log.Warning(delEx, "Rollback OU après échec protection : {OuDn}", ouDn);
+                        }
+                        http.Response.StatusCode = 400;
+                        await http.Response.WriteAsJsonAsync(new
+                        {
+                            error = "OU créée puis annulée : impossible d’appliquer la protection (DACL).",
+                            serverError = protErr,
+                            hint = "Le compte de service LDAP doit pouvoir lire/écrire nTSecurityDescriptor sur l’OU et son parent (Write DACL, souvent « Contrôle total » sur l’OU et le parent)."
+                        });
+                        return;
+                    }
+                }
 
                 await http.Response.WriteAsJsonAsync(new { success = true, dn = ouDn });
             }
@@ -4199,10 +5077,15 @@ public class Program
                     return;
                 }
 
-                if (!DnIsUnder(req.OuDn, cfg.Ldap.BaseDn))
+                req.OuDn = req.OuDn.Trim();
+                if (!string.IsNullOrWhiteSpace(req.NewParentDn))
+                    req.NewParentDn = req.NewParentDn.Trim();
+                var explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+
+                if (!DnIsUnder(req.OuDn, explorerBaseDn))
                 {
                     http.Response.StatusCode = 403;
-                    await http.Response.WriteAsJsonAsync(new { error = "OuDn hors baseDn." });
+                    await http.Response.WriteAsJsonAsync(new { error = "OuDn hors baseDn explorateur." });
                     return;
                 }
 
@@ -4223,16 +5106,16 @@ public class Program
 
                 string currentDn = req.OuDn;
 
-                // 1) Move/rename en UNE opération si possible
+                // 1) Move/rename in a single operation when possible
                 bool wantRename = !string.IsNullOrWhiteSpace(req.NewName);
                 bool wantMove = !string.IsNullOrWhiteSpace(req.NewParentDn);
 
                 if (wantMove)
                 {
-                    if (!DnIsUnder(req.NewParentDn!, cfg.Ldap.BaseDn))
+                    if (!DnIsUnder(req.NewParentDn!, explorerBaseDn))
                     {
                         http.Response.StatusCode = 403;
-                        await http.Response.WriteAsJsonAsync(new { error = "NewParentDn hors baseDn." });
+                        await http.Response.WriteAsJsonAsync(new { error = "NewParentDn hors baseDn explorateur." });
                         return;
                     }
                     if (!ParentAcceptsOu(connection, req.NewParentDn!))
@@ -4259,10 +5142,24 @@ public class Program
                     currentDn = $"{newRdn},{targetParent}";
                 }
 
-                // 2) Modifs attributaires (description / protection)
-                var mods = new List<DirectoryAttributeModification>();
+                // 2) Protection = DACL on OU + parent (RSAT-style), not adminDescription on the OU.
+                if (req.Protected.HasValue)
+                {
+                    if (!TrySetOuAccidentalDeletionProtection(connection, currentDn, req.Protected.Value, out var protErr))
+                    {
+                        http.Response.StatusCode = 400;
+                        await http.Response.WriteAsJsonAsync(new
+                        {
+                            error = "Échec de la mise à jour de la protection (DACL / nTSecurityDescriptor).",
+                            serverError = protErr,
+                            hint = "Compte de service : droits de lecture/écriture du descripteur de sécurité sur l’OU et son conteneur parent."
+                        });
+                        return;
+                    }
+                }
 
-                if (req.Description != null) // null => ne pas toucher ; "" => supprimer
+                // 3) Description only (null => leave unchanged; "" => remove)
+                if (req.Description != null)
                 {
                     var m = new DirectoryAttributeModification { Name = "description" };
                     if (req.Description == "")
@@ -4272,27 +5169,7 @@ public class Program
                         m.Operation = DirectoryAttributeOperation.Replace;
                         m.Add(req.Description);
                     }
-                    mods.Add(m);
-                }
-
-                if (req.Protected.HasValue)
-                {
-                    var m = new DirectoryAttributeModification { Name = "adminDescription" };
-                    if (req.Protected.Value)
-                    {
-                        m.Operation = DirectoryAttributeOperation.Replace;
-                        m.Add(OU_PROTECT_MARKER);
-                    }
-                    else
-                    {
-                        m.Operation = DirectoryAttributeOperation.Delete;
-                    }
-                    mods.Add(m);
-                }
-
-                if (mods.Count > 0)
-                {
-                    var mreq = new ModifyRequest(currentDn, mods.ToArray());
+                    var mreq = new ModifyRequest(currentDn, m);
                     _ = (ModifyResponse)connection.SendRequest(mreq);
                 }
 
@@ -4330,10 +5207,12 @@ public class Program
                     return;
                 }
 
-                if (!DnIsUnder(req.OuDn, cfg.Ldap.BaseDn))
+                var ouDn = req.OuDn.Trim();
+                var explorerBaseDn = EffectiveExplorerBaseDn(cfg);
+                if (!DnIsUnder(ouDn, explorerBaseDn))
                 {
                     http.Response.StatusCode = 403;
-                    await http.Response.WriteAsJsonAsync(new { error = "OuDn hors baseDn." });
+                    await http.Response.WriteAsJsonAsync(new { error = "OuDn hors baseDn explorateur." });
                     return;
                 }
 
@@ -4345,32 +5224,32 @@ public class Program
                     return;
                 }
 
-                // Vérifier l'OU par recherche BASE
-                if (!TryGetEntry(connection, req.OuDn, out var ou) || ou is null || !EntryIsOu(ou))
+                // Verify OU via BASE search
+                if (!TryGetEntry(connection, ouDn, out var ou) || ou is null || !EntryIsOu(ou))
                 {
                     http.Response.StatusCode = 404;
                     await http.Response.WriteAsJsonAsync(new { error = "OU introuvable." });
                     return;
                 }
 
-                if (OuIsProtected(connection, req.OuDn))
+                if (OuIsProtected(connection, ouDn))
                 {
                     http.Response.StatusCode = 403;
                     await http.Response.WriteAsJsonAsync(new { error = "OU protégée contre la suppression." });
                     return;
                 }
 
-                if (!OuIsEmpty(connection, req.OuDn))
+                if (!OuIsEmpty(connection, ouDn))
                 {
                     http.Response.StatusCode = 409;
                     await http.Response.WriteAsJsonAsync(new { error = "OU non vide : suppression refusée." });
                     return;
                 }
 
-                var del = new DeleteRequest(req.OuDn);
+                var del = new DeleteRequest(ouDn);
                 _ = (DeleteResponse)connection.SendRequest(del);
 
-                await http.Response.WriteAsJsonAsync(new { success = true, dn = req.OuDn });
+                await http.Response.WriteAsJsonAsync(new { success = true, dn = ouDn });
             }
             catch (DirectoryOperationException doe)
             {
