@@ -36,6 +36,23 @@ ADSelfService-API/
 - AD explorer and object search.
 - Tool access filtered by user permissions.
 
+## Project positioning
+
+`ADSelfService` is especially well suited for:
+
+- homelabs and test environments
+- small to medium organizations
+- IT teams that want a simple, readable, self-hosted base
+
+The project can also be used in production when standard hardening is applied:
+
+- proper TLS between web client and API
+- protected LDAP transport (`LDAPS` or `Kerberos sealing`)
+- strong internal shared secret (`InternalSharedSecret`)
+- strict IP filtering (`AllowedIps`)
+- least-privilege AD service account
+- backups, monitoring, and update process
+
 ## Mandatory security baseline
 
 Current code behavior enforces:
