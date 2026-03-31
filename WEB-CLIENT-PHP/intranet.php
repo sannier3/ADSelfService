@@ -463,14 +463,16 @@ function sanitize_tool_instructions_html(string $html): string
     if (!$ok) {
         libxml_clear_errors();
         libxml_use_internal_errors($prev);
-        return '';
+        // Fallback to safe plain text so instructions are still visible if HTML is malformed.
+        return nl2br(htmlspecialchars(strip_tags($html), ENT_QUOTES, 'UTF-8'));
     }
 
     $root = $dom->getElementById($wrapperId);
     if (!$root) {
         libxml_clear_errors();
         libxml_use_internal_errors($prev);
-        return '';
+        // Fallback to safe plain text so instructions are still visible if wrapper resolution fails.
+        return nl2br(htmlspecialchars(strip_tags($html), ENT_QUOTES, 'UTF-8'));
     }
 
     $sanitizeNode = function (DOMNode $node) use (&$sanitizeNode, $allowedTags, $allowedAttrs) {
@@ -847,6 +849,34 @@ function intranet_dns_suffix_from_base_dn(string $baseDn): string
         return strtolower(implode('.', $m[1]));
     }
     return 'local';
+}
+
+/**
+ * Base login used for tool hints.
+ * We prefer sAMAccountName so admin-defined suffixes can be appended safely.
+ */
+function intranet_tool_login_base(array $userInfo, ?string $sessionUsername): string
+{
+    $sam = trim((string) ($userInfo['samAccountName'] ?? $userInfo['SamAccountName'] ?? ''));
+    if ($sam !== '') {
+        return $sam;
+    }
+
+    $raw = trim((string) ($sessionUsername ?? ''));
+    if ($raw === '') {
+        return '';
+    }
+
+    // DOMAIN\user -> user
+    if (str_contains($raw, '\\')) {
+        $parts = explode('\\', $raw);
+        $raw = end($parts) ?: $raw;
+    }
+    // user@domain.tld -> user
+    if (str_contains($raw, '@')) {
+        $raw = (string) strstr($raw, '@', true);
+    }
+    return trim($raw);
 }
 
 /** isAdmin from the API (camelCase / PascalCase, bool or scalar values). */
@@ -4049,6 +4079,22 @@ if ($f = flash_take()) {
                 toggleOu();
             }
 
+            // Tools: toggle instructions panels without inline JavaScript.
+            document.addEventListener('click', (e) => {
+                const btn = e.target.closest('button[data-toggle-inst]');
+                if (!btn) return;
+                const targetId = btn.getAttribute('data-toggle-inst') || '';
+                if (!targetId) return;
+                const panel = document.getElementById(targetId);
+                if (!panel) return;
+                const open = panel.getAttribute('data-open') === '1';
+                panel.setAttribute('data-open', open ? '0' : '1');
+                panel.style.display = open ? 'none' : 'block';
+                btn.textContent = open
+                    ? (btn.getAttribute('data-label-open') || 'Instructions')
+                    : (btn.getAttribute('data-label-close') || 'Hide instructions');
+            });
+
             // AD explorer: tree selection, details pane, contextual actions
             const adTree = document.getElementById('ad-tree');
             const adDetails = document.getElementById('ad-details');
@@ -5268,7 +5314,7 @@ if ($uiError) {
                         <?php else: ?>
                             <div class="tools">
                                 <?php
-                                $loginBase = $userInfo['userPrincipalName'] ?? $_SESSION['username'];
+                                $loginBase = intranet_tool_login_base($userInfo, $_SESSION['username'] ?? null);
                                 foreach ($visibleTools as $t):
                                     $toolId = (int) ($t['id'] ?? 0);
                                     $title = $t['title'] ?? '';
@@ -5311,8 +5357,11 @@ if ($uiError) {
                                                         <button
                                                             type="button"
                                                             class="btn"
+                                                            data-toggle-inst="tool-inst-<?= $toolId ?>"
+                                                            data-label-open="<?= htmlspecialchars(__('tools_instructions'), ENT_QUOTES, 'UTF-8') ?>"
+                                                            data-label-close="<?= htmlspecialchars(__('tools_hide_instructions'), ENT_QUOTES, 'UTF-8') ?>"
                                                             style="padding:6px 10px;background:transparent;border:1px solid var(--border,#1f2937);color:var(--sub,#9ca3af);font-size:12px"
-                                                            onclick="(function(id,btn){var el=document.getElementById(id);if(!el)return;var open=el.getAttribute('data-open')==='1';el.setAttribute('data-open',open?'0':'1');el.style.display=open?'none':'block';btn.innerText=open?<?= json_encode(__('tools_instructions'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>:<?= json_encode(__('tools_hide_instructions'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;})('tool-inst-<?= $toolId ?>', this);">
+                                                            >
                                                             <?= htmlspecialchars(__('tools_instructions')) ?>
                                                         </button>
                                                     <?php endif; ?>

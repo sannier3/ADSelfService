@@ -24,6 +24,8 @@ if (!is_array($CONFIG)) {
     exit;
 }
 $GLOBALS['CONFIG'] = $CONFIG;
+require_once __DIR__ . '/intranet-i18n.php';
+intranet_i18n_bootstrap();
 
 $FORGOT_ENABLED = (bool) ($CONFIG['FORGOT_PASSWORD_ENABLED'] ?? true);
 if (!$FORGOT_ENABLED) {
@@ -36,7 +38,7 @@ $API_SHARED_SECRET = (string) ($CONFIG['INTERNAL_SHARED_SECRET'] ?? '');
 $API_INSECURE_SKIP_VERIFY = (bool) ($CONFIG['API_INSECURE_SKIP_VERIFY'] ?? false);
 if ($API_BASE === '' || $API_SHARED_SECRET === '' || strlen($API_SHARED_SECRET) < 32) {
     http_response_code(500);
-    echo 'Configuration API invalide.';
+    echo htmlspecialchars(__('forgot_error_config'));
     exit;
 }
 if (stripos($API_BASE, 'https://') !== 0) {
@@ -59,6 +61,9 @@ $TWILIO_FROM_NUMBER = (string) ($CONFIG['TWILIO_FROM_NUMBER'] ?? '');
 
 define('RESET_CODE_TTL', 30); // minutes
 define('USER_PAGE_SIZE', 500);
+define('RESET_MAX_ATTEMPTS_PER_SAM_IP', 5);
+define('RESET_MAX_ATTEMPTS_PER_IP', 20);
+define('RESET_BLOCK_MINUTES', 30);
 
 function csrf(): string
 {
@@ -106,12 +111,12 @@ function callApi(string $method, string $endpoint, ?array $data = null): array
     if ($resp === false) {
         $err = curl_error($ch);
         curl_close($ch);
-        return ['error' => true, 'httpCode' => $code, 'message' => "Erreur réseau: $err", 'data' => null];
+        return ['error' => true, 'httpCode' => $code, 'message' => sprintf(__('err_network'), $err), 'data' => null];
     }
     curl_close($ch);
     $json = json_decode($resp, true);
     if ($json === null && json_last_error() !== JSON_ERROR_NONE) {
-        return ['error' => true, 'httpCode' => $code, 'message' => 'Réponse JSON invalide', 'data' => null];
+        return ['error' => true, 'httpCode' => $code, 'message' => __('err_invalid_json'), 'data' => null];
     }
     return ['error' => ($code < 200 || $code >= 300), 'httpCode' => $code, 'message' => is_array($json) && isset($json['error']) ? $json['error'] : '', 'data' => $json];
 }
@@ -161,7 +166,7 @@ function reset_codes_bootstrap(PDO $pdo): void
             CREATE TABLE IF NOT EXISTS reset_codes (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 samaccountname VARCHAR(255) NOT NULL,
-                reset_code VARCHAR(20) NOT NULL,
+                reset_code_hash VARCHAR(255) NOT NULL,
                 reset_code_date DATETIME NOT NULL,
                 UNIQUE KEY uq_sam (samaccountname)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -171,7 +176,7 @@ function reset_codes_bootstrap(PDO $pdo): void
             CREATE TABLE IF NOT EXISTS reset_codes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 samaccountname TEXT NOT NULL UNIQUE,
-                reset_code TEXT NOT NULL,
+                reset_code_hash TEXT NOT NULL,
                 reset_code_date TEXT NOT NULL
             )
         ");
@@ -223,16 +228,14 @@ function reset_attempts_register_failure(PDO $pdo, string $sam, string $ip): voi
 {
     reset_attempts_bootstrap($pdo);
     $now = date('Y-m-d H:i:s');
-    $maxAttempts = 5;
-    $blockMinutes = 30;
 
     $q = $pdo->prepare("SELECT fail_count FROM reset_attempts WHERE samaccountname = ? AND ip = ? LIMIT 1");
     $q->execute([$sam, $ip]);
     $row = $q->fetch(PDO::FETCH_ASSOC);
     $count = (int) ($row['fail_count'] ?? 0) + 1;
     $blockedUntil = null;
-    if ($count >= $maxAttempts) {
-        $blockedUntil = date('Y-m-d H:i:s', time() + ($blockMinutes * 60));
+    if ($count >= RESET_MAX_ATTEMPTS_PER_SAM_IP) {
+        $blockedUntil = date('Y-m-d H:i:s', time() + (RESET_BLOCK_MINUTES * 60));
         $count = 0; // on repart après verrouillage
     }
 
@@ -250,6 +253,72 @@ function reset_attempts_clear(PDO $pdo, string $sam, string $ip): void
     reset_attempts_bootstrap($pdo);
     $d = $pdo->prepare("DELETE FROM reset_attempts WHERE samaccountname = ? AND ip = ?");
     $d->execute([$sam, $ip]);
+}
+
+function reset_attempts_ip_bootstrap(PDO $pdo): void
+{
+    $drv = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    if ($drv === 'mysql') {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS reset_attempts_ip (
+                ip VARCHAR(64) NOT NULL PRIMARY KEY,
+                fail_count INT NOT NULL DEFAULT 0,
+                blocked_until DATETIME NULL,
+                updated_at DATETIME NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ");
+    } else {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS reset_attempts_ip (
+                ip TEXT NOT NULL PRIMARY KEY,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                blocked_until TEXT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ");
+    }
+}
+
+function reset_attempts_ip_is_blocked(PDO $pdo, string $ip): bool
+{
+    reset_attempts_ip_bootstrap($pdo);
+    $q = $pdo->prepare("SELECT blocked_until FROM reset_attempts_ip WHERE ip = ? LIMIT 1");
+    $q->execute([$ip]);
+    $row = $q->fetch(PDO::FETCH_ASSOC);
+    if (!$row || empty($row['blocked_until'])) {
+        return false;
+    }
+    $ts = DateTime::createFromFormat('Y-m-d H:i:s', (string) $row['blocked_until']);
+    return $ts instanceof DateTime && $ts->getTimestamp() > time();
+}
+
+function reset_attempts_ip_register_failure(PDO $pdo, string $ip): void
+{
+    reset_attempts_ip_bootstrap($pdo);
+    $now = date('Y-m-d H:i:s');
+    $q = $pdo->prepare("SELECT fail_count FROM reset_attempts_ip WHERE ip = ? LIMIT 1");
+    $q->execute([$ip]);
+    $row = $q->fetch(PDO::FETCH_ASSOC);
+    $count = (int) ($row['fail_count'] ?? 0) + 1;
+    $blockedUntil = null;
+    if ($count >= RESET_MAX_ATTEMPTS_PER_IP) {
+        $blockedUntil = date('Y-m-d H:i:s', time() + (RESET_BLOCK_MINUTES * 60));
+        $count = 0;
+    }
+    if ($row) {
+        $u = $pdo->prepare("UPDATE reset_attempts_ip SET fail_count = ?, blocked_until = ?, updated_at = ? WHERE ip = ?");
+        $u->execute([$count, $blockedUntil, $now, $ip]);
+    } else {
+        $i = $pdo->prepare("INSERT INTO reset_attempts_ip (ip, fail_count, blocked_until, updated_at) VALUES (?, ?, ?, ?)");
+        $i->execute([$ip, $count, $blockedUntil, $now]);
+    }
+}
+
+function reset_attempts_ip_clear(PDO $pdo, string $ip): void
+{
+    reset_attempts_ip_bootstrap($pdo);
+    $d = $pdo->prepare("DELETE FROM reset_attempts_ip WHERE ip = ?");
+    $d->execute([$ip]);
 }
 
 /**
@@ -297,13 +366,14 @@ function send_mail(string $toEmail, string $subject, string $bodyHtml, ?string $
 
 function sendResetEmail(string $toEmail, string $username, int $code): bool
 {
-    $subject = '[Intranet] Code de réinitialisation';
+    $subject = __('forgot_email_subject');
     $html = '<html><body style="font-family:system-ui,Segoe UI,Roboto,Arial">
     <div style="max-width:560px;margin:auto;border:1px solid #ddd;border-radius:12px;padding:16px">
-      <h2 style="margin:0 0 8px;color:#1d4ed8">Réinitialisation</h2>
-      <p>Bonjour <strong>' . htmlspecialchars($username) . '</strong>, voici votre code :</p>
+      <h2 style="margin:0 0 8px;color:#1d4ed8">' . htmlspecialchars(__('forgot_email_heading')) . '</h2>
+      <p>' . sprintf(__('forgot_email_greeting'), '<strong>' . htmlspecialchars($username) . '</strong>') . '</p>
+      <p>' . htmlspecialchars(__('forgot_email_code_intro')) . '</p>
       <p style="font-size:24px;font-weight:700;letter-spacing:6px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:10px;padding:10px;text-align:center;color:#1e40af">' . $code . '</p>
-      <p>Valable ' . RESET_CODE_TTL . ' minutes.</p>
+      <p>' . sprintf(__('forgot_email_valid_for'), RESET_CODE_TTL) . '</p>
     </div></body></html>';
     return send_mail($toEmail, $subject, $html);
 }
@@ -352,17 +422,17 @@ $success = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (($_POST['step'] ?? '') === 'request_code') {
         if (!csrf_ok($_POST['csrf'] ?? '')) {
-            $errors[] = 'Session expirée.';
+            $errors[] = __('msg_session_expired');
             $mode = 'request';
         } elseif ($HCAPTCHA_ENABLED && (empty($_POST['h-captcha-response']) || !verifyCaptcha($_POST['h-captcha-response'], $HCAPTCHA_SECRET, $_SERVER['REMOTE_ADDR'] ?? ''))) {
-            $errors[] = 'Captcha invalide.';
+            $errors[] = __('msg_captcha_invalid');
             $mode = 'request';
         } else {
             $identifier = trim((string) ($_POST['identifier'] ?? ''));
-            if ($identifier === '') $errors[] = 'Saisissez votre e-mail ou téléphone.';
+            if ($identifier === '') $errors[] = __('forgot_error_identifier_required');
             if (!$errors && $API_BASE !== '') {
                 // Réponse volontairement uniforme pour éviter l'énumération de comptes.
-                $success = 'Si un compte correspond, un code de réinitialisation a été envoyé. Il est valable ' . RESET_CODE_TTL . ' minutes.';
+                $success = sprintf(__('forgot_success_code_sent'), RESET_CODE_TTL);
                 $mode = 'reset';
 
                 $lookup = callApi('GET', '/recovery/lookup?identifier=' . rawurlencode($identifier));
@@ -376,10 +446,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         try {
                             $pdo = get_pdo();
                             reset_codes_bootstrap($pdo);
-                            $up = $pdo->prepare("UPDATE reset_codes SET reset_code = ?, reset_code_date = ? WHERE samaccountname = ?");
-                            $up->execute([(string) $code, $now, $sam]);
+                            $codeHash = password_hash((string) $code, PASSWORD_DEFAULT);
+                            $up = $pdo->prepare("UPDATE reset_codes SET reset_code_hash = ?, reset_code_date = ? WHERE samaccountname = ?");
+                            $up->execute([(string) $codeHash, $now, $sam]);
                             if ($up->rowCount() === 0) {
-                                $pdo->prepare("INSERT INTO reset_codes (samaccountname, reset_code, reset_code_date) VALUES (?, ?, ?)")->execute([$sam, (string) $code, $now]);
+                                $pdo->prepare("INSERT INTO reset_codes (samaccountname, reset_code_hash, reset_code_date) VALUES (?, ?, ?)")
+                                    ->execute([$sam, (string) $codeHash, $now]);
                             }
 
                             $sent = false;
@@ -388,7 +460,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             } else {
                                 $phone = normalizePhone($identifier);
                                 if ($phone !== false && $TWILIO_SMS_ENABLED) {
-                                    $msg = 'Votre code de réinitialisation : ' . $code . '. Valable ' . RESET_CODE_TTL . ' min.';
+                                    $msg = sprintf(__('forgot_sms_message'), $code, RESET_CODE_TTL);
                                     $sent = send_sms_twilio($phone, $msg);
                                 }
                             }
@@ -406,66 +478,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if (($_POST['step'] ?? '') === 'do_reset') {
         if (!csrf_ok($_POST['csrf'] ?? '')) {
-            $errors[] = 'Session expirée.';
+            $errors[] = __('msg_session_expired');
             $mode = 'reset';
         } else {
             $sam = trim((string) ($_POST['samaccountname'] ?? ''));
             $codeIn = trim((string) ($_POST['reset_code'] ?? ''));
             $new = (string) ($_POST['new_password'] ?? '');
             $conf = (string) ($_POST['confirm_password'] ?? '');
-            if ($sam === '' || $codeIn === '' || $new === '' || $conf === '') $errors[] = 'Tous les champs sont requis.';
-            if ($new !== $conf) $errors[] = 'Le mot de passe et sa confirmation diffèrent.';
+            if ($sam === '' || $codeIn === '' || $new === '' || $conf === '') $errors[] = __('msg_all_fields_required');
+            if ($new !== $conf) $errors[] = __('msg_password_mismatch');
             if (!$errors) {
                 $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
                 try {
                     $pdo = get_pdo();
                     reset_codes_bootstrap($pdo);
                     if (reset_attempts_is_blocked($pdo, $sam, $ip)) {
-                        $errors[] = 'Trop de tentatives. Réessayez plus tard.';
+                        $errors[] = __('forgot_error_too_many_attempts');
+                        $mode = 'reset';
+                    }
+                    if (reset_attempts_ip_is_blocked($pdo, $ip)) {
+                        $errors[] = __('forgot_error_too_many_attempts');
                         $mode = 'reset';
                     }
                     if ($errors) {
                         throw new RuntimeException('blocked');
                     }
-                    $q = $pdo->prepare("SELECT reset_code, reset_code_date FROM reset_codes WHERE samaccountname = ? LIMIT 1");
+                    $q = $pdo->prepare("SELECT reset_code_hash, reset_code_date FROM reset_codes WHERE samaccountname = ? LIMIT 1");
                     $q->execute([$sam]);
                     $row = $q->fetch(PDO::FETCH_ASSOC);
-                    if (!$row) $errors[] = 'Code invalide ou expiré.';
+                    if (!$row) $errors[] = __('forgot_error_code_invalid');
                     else {
-                        if ((string) $row['reset_code'] !== (string) $codeIn) $errors[] = 'Code invalide ou expiré.';
+                        $hash = (string) ($row['reset_code_hash'] ?? '');
+                        $okCode = ($hash !== '') && password_verify((string) $codeIn, $hash);
+                        if (!$okCode) $errors[] = __('forgot_error_code_invalid');
                         else {
                             $ts = DateTime::createFromFormat('Y-m-d H:i:s', $row['reset_code_date']);
-                            if (!$ts) $errors[] = 'Code invalide ou expiré.';
+                            if (!$ts) $errors[] = __('forgot_error_code_invalid');
                             else {
                                 $ageMin = (time() - $ts->getTimestamp()) / 60;
-                                if ($ageMin > RESET_CODE_TTL) $errors[] = 'Code invalide ou expiré.';
+                                if ($ageMin > RESET_CODE_TTL) $errors[] = __('forgot_error_code_invalid');
                             }
                         }
                     }
                 } catch (Throwable $e) {
                     if ($e->getMessage() !== 'blocked') {
-                        $errors[] = 'Erreur interne.';
+                        $errors[] = __('forgot_error_internal');
                     }
                 }
                 if (!$errors) {
                     $r = callApi('POST', '/admin/changePassword', ['username' => $sam, 'newPassword' => $new]);
                     if ($r['error']) {
-                        $errors[] = 'Impossible de changer le mot de passe.';
+                        $errors[] = __('forgot_error_change_password');
                         try {
                             reset_attempts_register_failure($pdo, $sam, $ip);
+                            reset_attempts_ip_register_failure($pdo, $ip);
                         } catch (Throwable) {
                         }
                     }
                     else {
                         $pdo->prepare("DELETE FROM reset_codes WHERE samaccountname = ?")->execute([$sam]);
                         reset_attempts_clear($pdo, $sam, $ip);
-                        $success = 'Mot de passe réinitialisé. Vous pouvez vous connecter.';
+                        reset_attempts_ip_clear($pdo, $ip);
+                        $success = __('forgot_success_password_reset');
                         $mode = 'request';
                     }
                 } else {
                     try {
                         $pdo = $pdo ?? get_pdo();
                         reset_attempts_register_failure($pdo, $sam, $ip ?? ($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
+                        reset_attempts_ip_register_failure($pdo, $ip ?? ($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
                     } catch (Throwable) {
                     }
                 }
@@ -477,69 +558,96 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $csrf = csrf();
 ?>
 <!doctype html>
-<html lang="fr">
+<html lang="<?= htmlspecialchars($INTRANET_LANG ?? 'fr', ENT_QUOTES, 'UTF-8') ?>">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mot de passe oublié</title>
+<title><?= htmlspecialchars(__('forgot_title')) ?></title>
 <?php if ($HCAPTCHA_ENABLED): ?><script src="https://hcaptcha.com/1/api.js" async defer></script><?php endif; ?>
 <style>
-:root{ --bg:#0f172a; --card:#111827; --text:#e5e7eb; --sub:#9ca3af; --primary:#3b82f6; --border:#334155; }
+:root{ --bg:#0f172a; --card:#111827; --text:#e5e7eb; --sub:#9ca3af; --primary:#3b82f6; --border:#334155; --shadow-card:0 16px 38px rgba(0,0,0,.35); }
 *{box-sizing:border-box}
 body{margin:0;background:linear-gradient(180deg,#0b1220,#0f172a 40%,#0b1220);color:var(--text);
-  font:16px/1.4 system-ui,Segoe UI,Roboto,Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}
-.card{width:100%;max-width:480px;background:rgba(17,24,39,.9);border:1px solid var(--border);border-radius:18px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,.35);backdrop-filter:blur(8px)}
+  font:16px/1.4 system-ui,Segoe UI,Roboto,Arial,sans-serif;min-height:100vh;padding:24px;}
+.container{max-width:560px;margin:0 auto}
+.nav{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+.nav-brand{font-weight:700}
+.lang-switch-wrap{position:relative}
+.lang-switch{appearance:none;background:#111827;border:1px solid var(--border);color:var(--text);border-radius:10px;padding:8px 34px 8px 12px;cursor:pointer}
+.lang-switch-wrap::after{content:"▾";position:absolute;right:11px;top:50%;transform:translateY(-52%);pointer-events:none;color:#9ca3af;font-size:12px}
+.card{width:100%;background:rgba(17,24,39,.9);border:1px solid var(--border);border-radius:0;padding:24px;box-shadow:var(--shadow-card);backdrop-filter:blur(8px)}
 h1{margin:.2rem 0 1rem;font-size:1.4rem}
 .label{display:block;margin:10px 2px 6px;color:var(--sub);font-size:.9rem}
-.input{width:100%;background:#1f2937;color:var(--text);border:1px solid var(--border);border-radius:12px;padding:12px 14px;outline:none;transition:.15s;border-bottom-width:2px}
+.input{width:100%;background:#1f2937;color:var(--text);border:1px solid var(--border);border-radius:0;padding:12px 14px;outline:none;transition:.15s;border-bottom-width:2px}
 .input:focus{border-color:var(--primary)}
-.btn{background:var(--primary);color:white;border:none;border-radius:12px;padding:12px 16px;font-weight:600;cursor:pointer;transition:.15s;width:100%}
+.btn{background:var(--primary);color:white;border:none;border-radius:0;padding:12px 16px;font-weight:600;cursor:pointer;transition:.15s;width:100%}
 .btn:hover{filter:brightness(.95)}
-.alert{padding:12px;border-radius:12px;margin:10px 0}
+.alert{padding:12px;border-radius:0;margin:10px 0}
 .err{background:rgba(239,68,68,.12);border:1px solid #7f1d1d}
 .ok{background:rgba(34,197,94,.12);border:1px solid #14532d}
 .link{display:inline-block;margin-top:8px;color:var(--primary)}
 </style>
 </head>
 <body>
-  <div class="card">
+  <div class="container">
+    <div class="nav">
+      <div class="nav-brand">Intranet</div>
+      <?php if (!empty($INTRANET_LANG_SWITCH_UI)): ?>
+      <div class="lang-switch-wrap" title="<?= htmlspecialchars(__('lang_switch_title')) ?>">
+        <form method="post" action="">
+          <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf()) ?>">
+          <input type="hidden" name="intranet_set_lang" value="1">
+          <label class="visually-hidden" for="forgot-lang"><?= htmlspecialchars(__('lang_switch_aria')) ?></label>
+          <select id="forgot-lang" name="intranet_lang" class="lang-switch" onchange="this.form.submit()">
+            <?php foreach (intranet_i18n_allowed_locales() as $loc): ?>
+              <option value="<?= htmlspecialchars($loc, ENT_QUOTES, 'UTF-8') ?>" <?= (($INTRANET_LANG ?? 'fr') === $loc) ? 'selected' : '' ?>>
+                <?= htmlspecialchars(intranet_i18n_locale_native_label($loc)) ?>
+              </option>
+            <?php endforeach; ?>
+          </select>
+        </form>
+      </div>
+      <?php endif; ?>
+    </div>
+    <div class="card">
     <?php if ($mode === 'request'): ?>
-      <h1>Mot de passe oublié</h1>
+      <h1><?= htmlspecialchars(__('forgot_request_title')) ?></h1>
       <?php if ($errors): ?><div class="alert err"><?php foreach ($errors as $e) echo '<div>' . htmlspecialchars($e) . '</div>'; ?></div><?php endif; ?>
       <?php if ($success): ?><div class="alert ok"><?= htmlspecialchars($success) ?></div><?php endif; ?>
       <form method="post" autocomplete="off" novalidate>
         <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
         <input type="hidden" name="step" value="request_code">
-        <label class="label" for="identifier">E-mail ou téléphone</label>
-        <input class="input" id="identifier" name="identifier" placeholder="mon@domaine.com ou 06XXXXXXXX" required>
+        <label class="label" for="identifier"><?= htmlspecialchars(__('forgot_identifier_label')) ?></label>
+        <input class="input" id="identifier" name="identifier" placeholder="<?= htmlspecialchars(__('forgot_identifier_placeholder')) ?>" required>
         <?php if ($HCAPTCHA_ENABLED): ?>
         <div style="margin:14px 0" class="h-captcha" data-sitekey="<?= htmlspecialchars($HCAPTCHA_SITEKEY) ?>"></div>
         <?php endif; ?>
-        <button class="btn" type="submit">Envoyer le code</button>
+        <button class="btn" type="submit"><?= htmlspecialchars(__('forgot_send_code')) ?></button>
       </form>
-      <a class="link" href="intranet.php">← Retour à la connexion</a>
+      <a class="link" href="intranet.php">← <?= htmlspecialchars(__('forgot_back_login')) ?></a>
 
     <?php else: ?>
-      <h1>Réinitialisation</h1>
+      <h1><?= htmlspecialchars(__('forgot_reset_title')) ?></h1>
       <?php if ($errors): ?><div class="alert err"><?php foreach ($errors as $e) echo '<div>' . htmlspecialchars($e) . '</div>'; ?></div><?php endif; ?>
       <?php if ($success): ?><div class="alert ok"><?= htmlspecialchars($success) ?></div><?php endif; ?>
       <form method="post" autocomplete="off" novalidate>
         <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf) ?>">
         <input type="hidden" name="step" value="do_reset">
-        <label class="label" for="sam">Identifiant (sAM)</label>
+        <label class="label" for="sam"><?= htmlspecialchars(__('forgot_sam_label')) ?></label>
         <input class="input" id="sam" name="samaccountname" required>
-        <label class="label" for="code">Code reçu</label>
+        <label class="label" for="code"><?= htmlspecialchars(__('forgot_code_label')) ?></label>
         <input class="input" id="code" name="reset_code" inputmode="numeric" required>
-        <label class="label" for="npw">Nouveau mot de passe</label>
+        <label class="label" for="npw"><?= htmlspecialchars(__('forgot_new_password_label')) ?></label>
         <input class="input" id="npw" name="new_password" type="password" required>
-        <label class="label" for="cpw">Confirmer le mot de passe</label>
+        <label class="label" for="cpw"><?= htmlspecialchars(__('forgot_confirm_password_label')) ?></label>
         <input class="input" id="cpw" name="confirm_password" type="password" required>
-        <button class="btn" type="submit">Valider</button>
+        <button class="btn" type="submit"><?= htmlspecialchars(__('forgot_submit_reset')) ?></button>
       </form>
-      <a class="link" href="intranet.php">← Retour à la connexion</a>
+      <a class="link" href="intranet.php">← <?= htmlspecialchars(__('forgot_back_login')) ?></a>
     <?php endif; ?>
-  </div>
-  <footer style="margin-top:24px;padding:8px 16px;font-size:12px;opacity:.65;text-align:center;">
+    </div>
+    <footer style="margin-top:24px;padding:8px 16px;font-size:12px;opacity:.65;text-align:center;">
     ADSelfService forgot password v<?= htmlspecialchars($APP_VERSION, ENT_QUOTES, 'UTF-8') ?>
-  </footer>
+    </footer>
+  </div>
 </body>
 </html>
