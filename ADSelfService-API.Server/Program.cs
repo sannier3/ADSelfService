@@ -773,6 +773,32 @@ public class Program
         }
         return null;
     }
+
+    // Attributes accepted by /user/updateProfile (kept aligned with both PHP intranet clients).
+    static readonly HashSet<string> UserProfileAllowedAttributes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "mail",
+        "givenName",
+        "sn",
+        "telephoneNumber",
+        "wWWHomePage",
+        "streetAddress",
+        "description"
+    };
+
+    // Attributes accepted by /admin/updateUser.
+    // Intentionally broader than self-service but limited to what current intranet clients use.
+    static readonly HashSet<string> AdminUpdateAllowedAttributes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "mail",
+        "givenName",
+        "sn",
+        "telephoneNumber",
+        "wWWHomePage",
+        "streetAddress",
+        "description",
+        "manager"
+    };
     static List<string> GetMemberOfDns(DirectoryAttribute? memberOfAttr)
     {
         var res = new List<string>();
@@ -1690,6 +1716,43 @@ public class Program
         _ = (ModifyResponse)conn.SendRequest(mreq);
     }
 
+    static void WriteNtSecurityDescriptorDaclOnly(LdapConnection conn, string dn, byte[] newSd)
+    {
+        var mod = new DirectoryAttributeModification
+        {
+            Name = "nTSecurityDescriptor",
+            Operation = DirectoryAttributeOperation.Replace
+        };
+        mod.Add(newSd);
+        var mreq = new ModifyRequest(dn, mod);
+        mreq.Controls.Add(new DirectoryControl("1.2.840.113556.1.4.801", LdapSdFlagsControlDaclOnly, true, true));
+        _ = (ModifyResponse)conn.SendRequest(mreq);
+    }
+
+    static bool IsNtSecurityDescriptorConstraint(DirectoryOperationException doe)
+    {
+        var msg = doe.Response?.ErrorMessage ?? doe.Message ?? "";
+        if (doe.Response?.ResultCode == ResultCode.ConstraintViolation) return true;
+        return msg.IndexOf("CONSTRAINT_ATT_TYPE", StringComparison.OrdinalIgnoreCase) >= 0
+            || msg.IndexOf("Att 20119", StringComparison.OrdinalIgnoreCase) >= 0
+            || msg.IndexOf("nTSecurityDescriptor", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    static void WriteNtSecurityDescriptorWithFallback(LdapConnection conn, string dn, byte[] newSd)
+    {
+        try
+        {
+            WriteNtSecurityDescriptorOgd(conn, dn, newSd);
+        }
+        catch (DirectoryOperationException doe) when (IsNtSecurityDescriptorConstraint(doe))
+        {
+            // Some AD setups reject O/G/DACL replacement with CONSTRAINT_ATT_TYPE on nTSecurityDescriptor.
+            // Retry with DACL-only control (RSAT semantics for accidental deletion protection).
+            Log.Warning(doe, "WriteNtSecurityDescriptor OGD rejected for {Dn}; fallback to DACL-only", dn);
+            WriteNtSecurityDescriptorDaclOnly(conn, dn, newSd);
+        }
+    }
+
     static bool MatchesEveryoneDenyDeleteDeleteTreeOnly(System.DirectoryServices.ActiveDirectoryAccessRule r)
     {
         if (r.AccessControlType != AccessControlType.Deny) return false;
@@ -1749,7 +1812,7 @@ public class Program
                     var pSec = new System.DirectoryServices.ActiveDirectorySecurity();
                     pSec.SetSecurityDescriptorBinaryForm(pBytesUn, AccessControlSections.All);
                     RemoveEveryoneDenyDeleteChildOnObject(pSec);
-                    WriteNtSecurityDescriptorOgd(conn, parentDn, pSec.GetSecurityDescriptorBinaryForm());
+                    WriteNtSecurityDescriptorWithFallback(conn, parentDn, pSec.GetSecurityDescriptorBinaryForm());
                 }
 
                 if (!TryReadNtSecurityDescriptorOgd(conn, ouDn, out var ouBytesUn) || ouBytesUn is null)
@@ -1760,7 +1823,7 @@ public class Program
                 var ouSecUn = new System.DirectoryServices.ActiveDirectorySecurity();
                 ouSecUn.SetSecurityDescriptorBinaryForm(ouBytesUn, AccessControlSections.All);
                 RemoveEveryoneDenyDeleteDeleteTreeOnObject(ouSecUn);
-                WriteNtSecurityDescriptorOgd(conn, ouDn, ouSecUn.GetSecurityDescriptorBinaryForm());
+                WriteNtSecurityDescriptorWithFallback(conn, ouDn, ouSecUn.GetSecurityDescriptorBinaryForm());
                 return true;
             }
 
@@ -1779,7 +1842,7 @@ public class Program
                     AccessControlType.Deny,
                     System.DirectoryServices.ActiveDirectorySecurityInheritance.None));
             }
-            WriteNtSecurityDescriptorOgd(conn, ouDn, ouSec.GetSecurityDescriptorBinaryForm());
+            WriteNtSecurityDescriptorWithFallback(conn, ouDn, ouSec.GetSecurityDescriptorBinaryForm());
 
             if (string.IsNullOrEmpty(parentDn))
                 return true;
@@ -1799,7 +1862,7 @@ public class Program
                     AccessControlType.Deny,
                     System.DirectoryServices.ActiveDirectorySecurityInheritance.None));
             }
-            WriteNtSecurityDescriptorOgd(conn, parentDn, pSecProt.GetSecurityDescriptorBinaryForm());
+            WriteNtSecurityDescriptorWithFallback(conn, parentDn, pSecProt.GetSecurityDescriptorBinaryForm());
             return true;
         }
         catch (DirectoryOperationException doe)
@@ -2671,6 +2734,16 @@ public class Program
                     var key = kv.Key;
                     var val = kv.Value;
 
+                    if (string.IsNullOrWhiteSpace(key) || !UserProfileAllowedAttributes.Contains(key))
+                    {
+                        http.Response.StatusCode = 400;
+                        await http.Response.WriteAsJsonAsync(new
+                        {
+                            error = $"Attribut non autorisé pour updateProfile: '{key}'."
+                        });
+                        return;
+                    }
+
                     // Light API-side validation for description
                     if (string.Equals(key, "description", StringComparison.OrdinalIgnoreCase) && val is not null && val.Length > 1024)
                     {
@@ -3189,6 +3262,15 @@ public class Program
                 {
                     var attrName = kv.Key?.Trim();
                     if (string.IsNullOrEmpty(attrName)) continue;
+                    if (!AdminUpdateAllowedAttributes.Contains(attrName))
+                    {
+                        http.Response.StatusCode = 400;
+                        await http.Response.WriteAsJsonAsync(new
+                        {
+                            error = $"Attribut non autorisé pour admin/updateUser: '{attrName}'."
+                        });
+                        return;
+                    }
 
                     var val = kv.Value?.Trim();
 
@@ -5145,7 +5227,11 @@ public class Program
                 // 2) Protection = DACL on OU + parent (RSAT-style), not adminDescription on the OU.
                 if (req.Protected.HasValue)
                 {
-                    if (!TrySetOuAccidentalDeletionProtection(connection, currentDn, req.Protected.Value, out var protErr))
+                    // Avoid rewriting nTSecurityDescriptor when state is already the requested one.
+                    // This prevents unnecessary ACL writes for "no-op" updates (rename/description only).
+                    var currentProtected = OuIsProtected(connection, currentDn);
+                    if (currentProtected != req.Protected.Value
+                        && !TrySetOuAccidentalDeletionProtection(connection, currentDn, req.Protected.Value, out var protErr))
                     {
                         http.Response.StatusCode = 400;
                         await http.Response.WriteAsJsonAsync(new
